@@ -14,7 +14,7 @@ require_relative 'lib/notifier'
 
 class ResponseServer
   DEFAULT_PORT = 9876
-  
+
   def initialize(port: DEFAULT_PORT)
     @port = port
     @notifier = Notifier.default
@@ -24,7 +24,7 @@ class ResponseServer
   def start
     @running = true
     @server = TCPServer.new('127.0.0.1', @port)
-    
+
     display_banner
     puts Terminal.success("✓ Server listening on port #{@port}")
     puts Terminal.dim("  Waiting for agent approval requests...")
@@ -66,13 +66,13 @@ class ResponseServer
 
   def display_banner
     banner = <<~BANNER
-    
+
       ╔═══════════════════════════════════════════════════════════╗
       ║                                                           ║
       ║   🤖  Agent Approval Response Server  🤖                  ║
       ║                                                           ║
       ╚═══════════════════════════════════════════════════════════╝
-    
+
     BANNER
     puts Terminal.colorize(banner, :bright_cyan, :bold)
   end
@@ -177,7 +177,7 @@ class ResponseServer
     puts Terminal.colorize('🔔 NEW APPROVAL REQUEST', :bright_yellow, :bold)
     puts Terminal.dim("  Received at #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}")
     puts
-    
+
     puts Terminal.box('📋 WORK SUMMARY', work_summary, color: :blue)
     puts
     puts Terminal.box('🧪 TESTING INSTRUCTIONS', testing_instructions, color: :magenta)
@@ -189,7 +189,7 @@ class ResponseServer
     puts Terminal.colorize('❓ AGENT QUESTION', :bright_cyan, :bold)
     puts Terminal.dim("  Received at #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}")
     puts
-    
+
     puts Terminal.box('🤔 QUESTION', question, color: :cyan)
     if context && !context.empty?
       puts
@@ -201,25 +201,25 @@ class ResponseServer
   def get_question_response
     # Flush any buffered input (e.g., extra newlines from previous submission)
     flush_stdin
-    
+
     puts Terminal.colorize('─' * 60, :dim)
     puts
     puts Terminal.colorize('  Please provide your answer:', :bold)
     puts Terminal.dim('  (Enter your answer, then press Enter twice to submit)')
     puts
-    
+
     answer = get_multiline_input
-    
+
     puts
     puts Terminal.success('✓ Answer sent to agent')
-    
+
     { answer: answer }
   end
 
   def get_user_response
     # Flush any buffered input (e.g., extra newlines from previous submission)
     flush_stdin
-    
+
     puts Terminal.colorize('─' * 60, :dim)
     puts
     puts Terminal.colorize('  What would you like to do?', :bold)
@@ -227,7 +227,7 @@ class ResponseServer
     puts Terminal.colorize('    [y/yes]', :green, :bold) + Terminal.dim(' - Approve the work (agent will complete)')
     puts Terminal.colorize('    [n/no] ', :red, :bold) + Terminal.dim(' - Reject and provide feedback')
     puts
-    
+
     loop do
       Terminal.prompt('Your decision')
       input = $stdin.gets&.strip&.downcase
@@ -242,9 +242,9 @@ class ResponseServer
         puts Terminal.warning('Please provide feedback for the agent:')
         puts Terminal.dim('(Enter your feedback, then press Enter twice to submit)')
         puts
-        
+
         feedback = get_multiline_input
-        
+
         puts
         puts Terminal.info("✓ Feedback sent to agent")
         return { approved: false, feedback: feedback }
@@ -257,13 +257,13 @@ class ResponseServer
   def get_multiline_input
     lines = []
     empty_line_count = 0
-    
+
     Terminal.prompt('Feedback')
-    
+
     while empty_line_count < 1
       line = $stdin.gets
       break unless line
-      
+
       line = line.chomp
       if line.empty?
         empty_line_count += 1
@@ -272,7 +272,7 @@ class ResponseServer
         lines << line
       end
     end
-    
+
     lines.join("\n")
   end
 
@@ -310,7 +310,7 @@ end
 # Main entry point
 if __FILE__ == $PROGRAM_NAME
   port = (ARGV[0] || ENV['APPROVAL_SERVER_PORT'] || ResponseServer::DEFAULT_PORT).to_i
-  
+
   server = ResponseServer.new(port: port)
   server.start
 end

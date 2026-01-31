@@ -105,11 +105,11 @@ end
 
 def request_user_approval(work_summary, testing_instructions)
   uri = URI("http://#{RESPONSE_SERVER_HOST}:#{RESPONSE_SERVER_PORT}/approval-request")
-  
+
   http = Net::HTTP.new(uri.host, uri.port)
   http.read_timeout = REQUEST_TIMEOUT
   http.open_timeout = 10
-  
+
   request = Net::HTTP::Post.new(uri.path)
   request['Content-Type'] = 'application/json'
   request.body = {
@@ -119,7 +119,7 @@ def request_user_approval(work_summary, testing_instructions)
 
   log "Sending approval request to response server..."
   response = http.request(request)
-  
+
   if response.code == '200'
     JSON.parse(response.body)
   else
@@ -135,11 +135,11 @@ end
 
 def request_user_question(question, context)
   uri = URI("http://#{RESPONSE_SERVER_HOST}:#{RESPONSE_SERVER_PORT}/question")
-  
+
   http = Net::HTTP.new(uri.host, uri.port)
   http.read_timeout = REQUEST_TIMEOUT
   http.open_timeout = 10
-  
+
   request = Net::HTTP::Post.new(uri.path)
   request['Content-Type'] = 'application/json'
   request.body = {
@@ -149,7 +149,7 @@ def request_user_question(question, context)
 
   log "Sending question to response server..."
   response = http.request(request)
-  
+
   if response.code == '200'
     JSON.parse(response.body)
   else

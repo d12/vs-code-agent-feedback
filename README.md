@@ -101,7 +101,7 @@ Before concluding ANY task, you MUST call the `get_user_approval` tool with:
 - A detailed summary of the work completed
 - Clear instructions for how to test/verify the work
 
-Only conclude the task after receiving approval. If the user provides feedback, 
+Only conclude the task after receiving approval. If the user provides feedback,
 continue working to address their concerns and request approval again.
 ```
 
