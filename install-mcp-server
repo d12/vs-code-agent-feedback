@@ -1,0 +1,168 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Install the getUserApproval MCP server into VS Code's user configuration
+
+require 'json'
+require 'fileutils'
+
+SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
+MCP_SERVER_PATH = File.join(SCRIPT_DIR, 'mcp-server', 'server.rb')
+
+# Detect the VS Code MCP config path based on OS
+def detect_mcp_config_path
+  case RUBY_PLATFORM
+  when /darwin/
+    # macOS - check both regular VS Code and Codespaces/Remote
+    paths = [
+      File.expand_path('~/Library/Application Support/Code/User/mcp.json'),
+      File.expand_path('~/.vscode-server/data/Machine/mcp.json'), # Codespaces/Remote
+    ]
+    paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
+  when /linux/
+    # Linux - check both local and Codespaces/Remote
+    paths = [
+      File.expand_path('~/.config/Code/User/mcp.json'),
+      File.expand_path('~/.vscode-server/data/Machine/mcp.json'), # Codespaces/Remote
+    ]
+    paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
+  when /mswin|mingw|cygwin/
+    # Windows
+    File.expand_path('~/AppData/Roaming/Code/User/mcp.json')
+  else
+    nil
+  end
+end
+
+def generate_server_config
+  {
+    'type' => 'stdio',
+    'command' => 'ruby',
+    'args' => [MCP_SERVER_PATH]
+  }
+end
+
+def colorize(text, color)
+  colors = {
+    red: "\e[31m",
+    green: "\e[32m",
+    yellow: "\e[33m",
+    blue: "\e[34m",
+    cyan: "\e[36m",
+    bold: "\e[1m",
+    reset: "\e[0m"
+  }
+  "#{colors[color]}#{text}#{colors[:reset]}"
+end
+
+def print_manual_instructions
+  config = { 'getUserApproval' => generate_server_config }
+  
+  puts ""
+  puts colorize("📋 Manual Installation", :bold)
+  puts ""
+  puts "Add this to your VS Code mcp.json file inside the \"servers\" object:"
+  puts ""
+  puts colorize(JSON.pretty_generate(config), :cyan)
+  puts ""
+  puts "Typical mcp.json locations:"
+  puts "  macOS:      ~/Library/Application Support/Code/User/mcp.json"
+  puts "  Linux:      ~/.config/Code/User/mcp.json"
+  puts "  Windows:    %APPDATA%/Code/User/mcp.json"
+  puts "  Codespaces: ~/.vscode-server/data/Machine/mcp.json"
+  puts ""
+end
+
+def install_mcp_server
+  puts colorize("🔧 Installing getUserApproval MCP Server", :bold)
+  puts ""
+  
+  # Verify the server script exists
+  unless File.exist?(MCP_SERVER_PATH)
+    puts colorize("❌ Error: MCP server script not found at:", :red)
+    puts "   #{MCP_SERVER_PATH}"
+    exit 1
+  end
+  
+  puts colorize("✓", :green) + " Found MCP server at: #{MCP_SERVER_PATH}"
+  
+  # Detect config path
+  config_path = detect_mcp_config_path
+  
+  if config_path.nil?
+    puts colorize("⚠️  Could not detect VS Code configuration path", :yellow)
+    print_manual_instructions
+    exit 1
+  end
+  
+  puts colorize("✓", :green) + " VS Code config path: #{config_path}"
+  
+  # Ensure directory exists
+  config_dir = File.dirname(config_path)
+  unless File.directory?(config_dir)
+    puts colorize("⚠️  VS Code config directory doesn't exist: #{config_dir}", :yellow)
+    puts "   This might mean VS Code hasn't been run yet, or you're using a different editor."
+    print_manual_instructions
+    exit 1
+  end
+  
+  # Load or create config
+  config = if File.exist?(config_path)
+             begin
+               JSON.parse(File.read(config_path))
+             rescue JSON::ParserError => e
+               puts colorize("❌ Error parsing existing mcp.json: #{e.message}", :red)
+               print_manual_instructions
+               exit 1
+             end
+           else
+             {}
+           end
+  
+  # Ensure servers object exists
+  config['servers'] ||= {}
+  
+  # Check if already installed
+  if config['servers']['getUserApproval']
+    existing_path = config['servers']['getUserApproval']['args']&.first
+    if existing_path == MCP_SERVER_PATH
+      puts colorize("✓", :green) + " getUserApproval is already installed and up to date!"
+      puts ""
+      return
+    else
+      puts colorize("⚠️  getUserApproval exists but points to different path:", :yellow)
+      puts "   Existing: #{existing_path}"
+      puts "   New:      #{MCP_SERVER_PATH}"
+      print "   Overwrite? [y/N] "
+      response = $stdin.gets&.strip&.downcase
+      unless response == 'y' || response == 'yes'
+        puts "   Skipped."
+        exit 0
+      end
+    end
+  end
+  
+  # Add our server config
+  config['servers']['getUserApproval'] = generate_server_config
+  
+  # Write config
+  begin
+    File.write(config_path, JSON.pretty_generate(config) + "\n")
+    puts colorize("✓", :green) + " Successfully installed getUserApproval MCP server!"
+    puts ""
+    puts colorize("📝 Next steps:", :bold)
+    puts "   1. Run " + colorize("./start-response-server", :cyan) + " in a terminal"
+    puts "   2. Restart VS Code or run 'MCP: List Servers' to see the new server"
+    puts "   3. The 'get_user_approval' tool will now be available in agent mode"
+    puts ""
+  rescue => e
+    puts colorize("❌ Error writing config file: #{e.message}", :red)
+    print_manual_instructions
+    exit 1
+  end
+end
+
+# Main
+if __FILE__ == $PROGRAM_NAME
+  install_mcp_server
+end

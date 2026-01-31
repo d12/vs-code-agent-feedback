@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Start the response server for agent approval requests
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_SCRIPT="$SCRIPT_DIR/response-server/server.rb"
+
+# Show help
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    echo "Usage: ./start-response-server [PORT]"
+    echo ""
+    echo "Start the response server for agent approval requests."
+    echo ""
+    echo "Arguments:"
+    echo "  PORT    Port to listen on (default: 9876)"
+    echo ""
+    echo "Examples:"
+    echo "  ./start-response-server        # Start on default port 9876"
+    echo "  ./start-response-server 8080   # Start on port 8080"
+    exit 0
+fi
+
+# Check if Ruby is available
+if ! command -v ruby &> /dev/null; then
+    echo "❌ Error: Ruby is not installed or not in PATH"
+    echo "   Please install Ruby 3.x to use this server"
+    exit 1
+fi
+
+# Check if server script exists
+if [[ ! -f "$SERVER_SCRIPT" ]]; then
+    echo "❌ Error: Server script not found at $SERVER_SCRIPT"
+    exit 1
+fi
+
+# Parse arguments
+PORT="${1:-9876}"
+
+echo "🚀 Starting response server..."
+echo "   Port: $PORT"
+echo "   Press Ctrl+C to stop"
+echo ""
+
+exec ruby "$SERVER_SCRIPT" "$PORT"
