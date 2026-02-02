@@ -23,7 +23,7 @@ def detect_mcp_config_path
     # Linux - check both local and Codespaces/Remote
     paths = [
       File.expand_path('~/.config/Code/User/mcp.json'),
-      File.expand_path('~/.vscode-server/data/Machine/mcp.json'), # Codespaces/Remote
+      File.expand_path('~/.vscode-remote/data/User/mcp.json'), # Codespaces/Remote
     ]
     paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
   when /mswin|mingw|cygwin/
@@ -57,7 +57,7 @@ end
 
 def print_manual_instructions
   config = { 'getUserApproval' => generate_server_config }
-  
+
   puts ""
   puts colorize("📋 Manual Installation", :bold)
   puts ""
@@ -76,27 +76,27 @@ end
 def install_mcp_server
   puts colorize("🔧 Installing getUserApproval MCP Server", :bold)
   puts ""
-  
+
   # Verify the server script exists
   unless File.exist?(MCP_SERVER_PATH)
     puts colorize("❌ Error: MCP server script not found at:", :red)
     puts "   #{MCP_SERVER_PATH}"
     exit 1
   end
-  
+
   puts colorize("✓", :green) + " Found MCP server at: #{MCP_SERVER_PATH}"
-  
+
   # Detect config path
   config_path = detect_mcp_config_path
-  
+
   if config_path.nil?
     puts colorize("⚠️  Could not detect VS Code configuration path", :yellow)
     print_manual_instructions
     exit 1
   end
-  
+
   puts colorize("✓", :green) + " VS Code config path: #{config_path}"
-  
+
   # Ensure directory exists
   config_dir = File.dirname(config_path)
   unless File.directory?(config_dir)
@@ -105,7 +105,7 @@ def install_mcp_server
     print_manual_instructions
     exit 1
   end
-  
+
   # Load or create config
   config = if File.exist?(config_path)
              begin
@@ -118,10 +118,10 @@ def install_mcp_server
            else
              {}
            end
-  
+
   # Ensure servers object exists
   config['servers'] ||= {}
-  
+
   # Check if already installed
   if config['servers']['getUserApproval']
     existing_path = config['servers']['getUserApproval']['args']&.first
@@ -141,10 +141,10 @@ def install_mcp_server
       end
     end
   end
-  
+
   # Add our server config
   config['servers']['getUserApproval'] = generate_server_config
-  
+
   # Write config
   begin
     File.write(config_path, JSON.pretty_generate(config) + "\n")
