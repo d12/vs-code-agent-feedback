@@ -72,7 +72,11 @@ You should see:
 
 ### 2. Configure VS Code
 
-Add the MCP server to your VS Code configuration. Edit `.vscode/mcp.json` in your workspace or your user MCP configuration:
+Add the MCP server to your VS Code configuration.
+
+The ./install-mcp-server script should do this automatically. You'll need to run this once per environment (laptop or codespaces environment). This script is tested on MacOS and Codespaces Linux.
+
+To do this manually, add the following to your MCP server configuration:
 
 ```json
 {
@@ -81,38 +85,20 @@ Add the MCP server to your VS Code configuration. Edit `.vscode/mcp.json` in you
       "type": "stdio",
       "command": "ruby",
       "args": [
-        "/FULL/PATH/TO/get-user-approval/mcp-server/server.rb"
+        "/FULL/PATH/TO/vs-code-agent-feedback/mcp-server/server.rb"
       ]
     }
   }
 }
 ```
 
-Replace `/FULL/PATH/TO/` with the actual path to the `get-user-approval` directory.
+Replace `/FULL/PATH/TO/` with the actual path to the `vs-code-agent-feedback` directory.
 
 ### 3. Configure Agent Instructions
 
-Add instructions to your `.github/copilot-instructions.md` or agent prompt:
+You must instruct your agent to use the `get_user_approval` tool before concluding any task. This is best done by adding "Chat instructions" which are instructions automatically prepended to all agent prompts. Click the Cog in the agent window and click "Chat instructions" to add instructions.
 
-```markdown
-## Completion Protocol
-
-Before concluding ANY task, you MUST call the `get_user_approval` tool with:
-- A detailed summary of the work completed
-- Clear instructions for how to test/verify the work
-
-Only conclude the task after receiving approval. If the user provides feedback,
-continue working to address their concerns and request approval again.
-```
-
-### 4. Test the Setup
-
-Run the integration test:
-
-```bash
-cd get-user-approval
-ruby test_integration.rb
-```
+A sample set of instructions is provided in sample_instructions.md.
 
 ## Tool Reference
 
