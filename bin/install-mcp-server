@@ -7,7 +7,8 @@ require 'json'
 require 'fileutils'
 
 SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
-MCP_SERVER_PATH = File.join(SCRIPT_DIR, 'mcp-server', 'server.rb')
+PROJECT_DIR = File.dirname(SCRIPT_DIR)
+MCP_SERVER_PATH = File.join(PROJECT_DIR, 'mcp-server', 'server.rb')
 
 # Detect the VS Code MCP config path based on OS
 def detect_mcp_config_path
@@ -151,9 +152,14 @@ def install_mcp_server
     puts colorize("✓", :green) + " Successfully installed getUserApproval MCP server!"
     puts ""
     puts colorize("📝 Next steps:", :bold)
-    puts "   1. Run " + colorize("./start-response-server", :cyan) + " in a terminal"
-    puts "   2. Restart VS Code or run 'MCP: List Servers' to see the new server"
-    puts "   3. The 'get_user_approval' tool will now be available in agent mode"
+    puts "   1. Run " + colorize("./bin/start-response-server", :cyan) + " on your LOCAL machine"
+    puts "   2. Open " + colorize("http://localhost:18463", :cyan) + " in your browser"
+    puts "   3. Restart VS Code or run 'MCP: List Servers' to see the new server"
+    puts "   4. The 'get_user_approval' and 'ask_question' tools will be available in agent mode"
+    puts ""
+    puts colorize("🔗 For CodeSpaces:", :bold)
+    puts "   The MCP server exposes port 14700. VS Code will auto-forward this port."
+    puts "   Your local response server will auto-discover connected CodeSpaces."
     puts ""
   rescue => e
     puts colorize("❌ Error writing config file: #{e.message}", :red)

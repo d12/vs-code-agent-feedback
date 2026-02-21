@@ -1,23 +1,34 @@
 #!/usr/bin/env bash
 # Start the response server for agent approval requests
+# This server provides a web interface for approving agent work
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_SCRIPT="$SCRIPT_DIR/response-server/server.rb"
+SERVER_SCRIPT="$SCRIPT_DIR/../response-server/server.rb"
 
 # Show help
 if [[ "$1" == "-h" || "$1" == "--help" ]]; then
     echo "Usage: ./start-response-server [PORT]"
     echo ""
-    echo "Start the response server for agent approval requests."
+    echo "Start the web-based response server for agent approval requests."
+    echo "This server should run on your LOCAL machine and will automatically"
+    echo "discover MCP clients running in CodeSpaces via port forwarding."
     echo ""
     echo "Arguments:"
-    echo "  PORT    Port to listen on (default: 9876)"
+    echo "  PORT    Port for web interface (default: 18463)"
+    echo ""
+    echo "Environment Variables:"
+    echo "  RESPONSE_SERVER_PORT    Alternative to PORT argument"
+    echo ""
+    echo "The server will:"
+    echo "  1. Serve a web UI at http://localhost:PORT"
+    echo "  2. Poll ports 14700-14715 to discover MCP clients"
+    echo "  3. Show agent requests from all connected CodeSpaces"
     echo ""
     echo "Examples:"
-    echo "  ./start-response-server        # Start on default port 9876"
-    echo "  ./start-response-server 8080   # Start on port 8080"
+    echo "  ./start-response-server           # Start on default port 18463"
+    echo "  ./start-response-server 8080      # Start on port 8080"
     exit 0
 fi
 
@@ -35,10 +46,11 @@ if [[ ! -f "$SERVER_SCRIPT" ]]; then
 fi
 
 # Parse arguments
-PORT="${1:-9876}"
+PORT="${1:-${RESPONSE_SERVER_PORT:-18463}}"
 
 echo "🚀 Starting response server..."
-echo "   Port: $PORT"
+echo "   Web UI: http://localhost:$PORT"
+echo "   Polling ports 14700-14715 for MCP clients"
 echo "   Press Ctrl+C to stop"
 echo ""
 

@@ -2,22 +2,27 @@
 # frozen_string_literal: true
 
 # MCP Server for Agent Approval System
-# This server provides the get_user_approval tool for agents to request user approval
+# This server provides the get_user_approval and ask_question tools for agents
+# It also exposes an HTTP server for the response server to poll for requests
 
 require 'json'
-require 'net/http'
-require 'uri'
+require 'socket'
+require 'securerandom'
+require 'time'
 
 # Configuration
-RESPONSE_SERVER_HOST = ENV['APPROVAL_SERVER_HOST'] || '127.0.0.1'
-RESPONSE_SERVER_PORT = (ENV['APPROVAL_SERVER_PORT'] || 9876).to_i
+CALLBACK_PORT = (ENV['MCP_CALLBACK_PORT'] || 14700).to_i
 REQUEST_TIMEOUT = (ENV['APPROVAL_TIMEOUT'] || 600).to_i # 10 minutes default
 
 # Server information
 SERVER_NAME = 'get-user-approval'
-SERVER_VERSION = '1.0.0'
+SERVER_VERSION = '2.0.0'
 
-# Tool definition
+# Generate a unique client ID for this instance
+CLIENT_ID = SecureRandom.uuid
+CLIENT_NAME = ENV['CODESPACE_NAME'] || ENV['MCP_CLIENT_NAME'] || "local-#{CLIENT_ID[0..7]}"
+
+# Tool definitions
 TOOLS = [
   {
     name: 'get_user_approval',
@@ -64,7 +69,13 @@ TOOLS = [
   }
 ].freeze
 
-def send_response(response)
+# Global state for pending requests and responses
+$pending_requests = {} # request_id => { type:, data:, created_at: }
+$responses = {} # request_id => response data
+$state_mutex = Mutex.new
+$response_conditions = {} # request_id => ConditionVariable
+
+def send_mcp_response(response)
   json = response.to_json
   $stdout.write(json)
   $stdout.write("\n")
@@ -103,64 +114,55 @@ def handle_tools_list(id, _params)
   }
 end
 
-def request_user_approval(work_summary, testing_instructions)
-  uri = URI("http://#{RESPONSE_SERVER_HOST}:#{RESPONSE_SERVER_PORT}/approval-request")
+# Create a pending request and wait for a response
+def create_request_and_wait(type, data)
+  request_id = SecureRandom.uuid
+  condition = ConditionVariable.new
+  mutex = Mutex.new
 
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.read_timeout = REQUEST_TIMEOUT
-  http.open_timeout = 10
-
-  request = Net::HTTP::Post.new(uri.path)
-  request['Content-Type'] = 'application/json'
-  request.body = {
-    work_summary: work_summary,
-    testing_instructions: testing_instructions
-  }.to_json
-
-  log "Sending approval request to response server..."
-  response = http.request(request)
-
-  if response.code == '200'
-    JSON.parse(response.body)
-  else
-    { 'error' => "Response server returned #{response.code}: #{response.body}" }
+  # Store the request
+  $state_mutex.synchronize do
+    $pending_requests[request_id] = {
+      type: type,
+      data: data,
+      created_at: Time.now
+    }
+    $response_conditions[request_id] = { condition: condition, mutex: mutex }
   end
-rescue Errno::ECONNREFUSED
-  { 'error' => 'Could not connect to response server. Make sure the response server is running.' }
-rescue Net::ReadTimeout
-  { 'error' => 'Request timed out waiting for user response.' }
-rescue => e
-  { 'error' => "Error communicating with response server: #{e.message}" }
-end
 
-def request_user_question(question, context)
-  uri = URI("http://#{RESPONSE_SERVER_HOST}:#{RESPONSE_SERVER_PORT}/question")
+  log "Created #{type} request #{request_id[0..7]}, waiting for response..."
 
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.read_timeout = REQUEST_TIMEOUT
-  http.open_timeout = 10
-
-  request = Net::HTTP::Post.new(uri.path)
-  request['Content-Type'] = 'application/json'
-  request.body = {
-    question: question,
-    context: context
-  }.to_json
-
-  log "Sending question to response server..."
-  response = http.request(request)
-
-  if response.code == '200'
-    JSON.parse(response.body)
-  else
-    { 'error' => "Response server returned #{response.code}: #{response.body}" }
+  # Wait for response with timeout
+  response = nil
+  mutex.synchronize do
+    deadline = Time.now + REQUEST_TIMEOUT
+    while response.nil? && Time.now < deadline
+      remaining = deadline - Time.now
+      break if remaining <= 0
+      
+      # Check if response has arrived
+      $state_mutex.synchronize do
+        response = $responses.delete(request_id)
+      end
+      
+      break if response
+      
+      # Wait with timeout
+      condition.wait(mutex, [remaining, 1].min)
+    end
   end
-rescue Errno::ECONNREFUSED
-  { 'error' => 'Could not connect to response server. Make sure the response server is running.' }
-rescue Net::ReadTimeout
-  { 'error' => 'Request timed out waiting for user response.' }
-rescue => e
-  { 'error' => "Error communicating with response server: #{e.message}" }
+
+  # Clean up
+  $state_mutex.synchronize do
+    $pending_requests.delete(request_id)
+    $response_conditions.delete(request_id)
+  end
+
+  if response
+    response
+  else
+    { 'error' => 'Request timed out waiting for user response.' }
+  end
 end
 
 def handle_tools_call(id, params)
@@ -177,12 +179,7 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: work_summary is required'
-            }
-          ],
+          content: [{ type: 'text', text: 'Error: work_summary is required' }],
           isError: true
         }
       }
@@ -193,19 +190,16 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: testing_instructions is required'
-            }
-          ],
+          content: [{ type: 'text', text: 'Error: testing_instructions is required' }],
           isError: true
         }
       }
     end
 
-    # Request approval from the response server
-    result = request_user_approval(work_summary, testing_instructions)
+    result = create_request_and_wait('approval', {
+      work_summary: work_summary,
+      testing_instructions: testing_instructions
+    })
 
     if result['error']
       log "Error: #{result['error']}"
@@ -213,12 +207,7 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: "Error: #{result['error']}"
-            }
-          ],
+          content: [{ type: 'text', text: "Error: #{result['error']}" }],
           isError: true
         }
       }
@@ -228,12 +217,10 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: "✅ APPROVED: The user has approved your work. You may now conclude this task."
-            }
-          ]
+          content: [{
+            type: 'text',
+            text: "✅ APPROVED: The user has approved your work. You may now conclude this task."
+          }]
         }
       }
     else
@@ -243,15 +230,14 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: "❌ NOT APPROVED: The user has requested changes.\n\nFeedback:\n#{feedback}\n\nPlease address the feedback and continue working on the task."
-            }
-          ]
+          content: [{
+            type: 'text',
+            text: "❌ NOT APPROVED: The user has requested changes.\n\nFeedback:\n#{feedback}\n\nPlease address the feedback and continue working on the task."
+          }]
         }
       }
     end
+
   when 'ask_question'
     question = arguments['question']
     context = arguments['context']
@@ -261,19 +247,16 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: 'Error: question is required'
-            }
-          ],
+          content: [{ type: 'text', text: 'Error: question is required' }],
           isError: true
         }
       }
     end
 
-    # Send question to the response server
-    result = request_user_question(question, context)
+    result = create_request_and_wait('question', {
+      question: question,
+      context: context
+    })
 
     if result['error']
       log "Error: #{result['error']}"
@@ -281,12 +264,7 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: "Error: #{result['error']}"
-            }
-          ],
+          content: [{ type: 'text', text: "Error: #{result['error']}" }],
           isError: true
         }
       }
@@ -297,15 +275,11 @@ def handle_tools_call(id, params)
         jsonrpc: '2.0',
         id: id,
         result: {
-          content: [
-            {
-              type: 'text',
-              text: "📝 USER ANSWER:\n\n#{answer}"
-            }
-          ]
+          content: [{ type: 'text', text: "📝 USER ANSWER:\n\n#{answer}" }]
         }
       }
     end
+
   else
     {
       jsonrpc: '2.0',
@@ -318,7 +292,7 @@ def handle_tools_call(id, params)
   end
 end
 
-def handle_request(request)
+def handle_mcp_request(request)
   method = request['method']
   id = request['id']
   params = request['params'] || {}
@@ -327,8 +301,7 @@ def handle_request(request)
   when 'initialize'
     handle_initialize(id, params)
   when 'notifications/initialized'
-    # This is a notification, no response needed
-    nil
+    nil # No response needed for notifications
   when 'tools/list'
     handle_tools_list(id, params)
   when 'tools/call'
@@ -340,36 +313,219 @@ def handle_request(request)
       {
         jsonrpc: '2.0',
         id: id,
-        error: {
-          code: -32601,
-          message: "Method not found: #{method}"
-        }
+        error: { code: -32601, message: "Method not found: #{method}" }
       }
     end
   end
 end
 
+# HTTP Server for response server polling
+class CallbackHTTPServer
+  def initialize(port)
+    @port = port
+    @actual_port = nil
+    @server = nil
+    @running = false
+  end
+
+  def start
+    # Try to bind to the configured port, or find an available one in the range
+    @actual_port = find_available_port
+    @server = TCPServer.new('0.0.0.0', @actual_port)
+    @running = true
+
+    log "HTTP callback server listening on port #{@actual_port}"
+    
+    Thread.new do
+      while @running
+        begin
+          client = @server.accept
+          Thread.new(client) { |c| handle_request(c) }
+        rescue IOError, Errno::EBADF
+          break
+        rescue => e
+          log "HTTP server error: #{e.message}" if @running
+        end
+      end
+    end
+  end
+
+  def stop
+    @running = false
+    @server&.close
+  end
+
+  def actual_port
+    @actual_port
+  end
+
+  private
+
+  def find_available_port
+    port = @port
+    max_port = @port + 15 # Try up to 16 ports
+
+    while port <= max_port
+      begin
+        test_server = TCPServer.new('0.0.0.0', port)
+        test_server.close
+        return port
+      rescue Errno::EADDRINUSE
+        port += 1
+      end
+    end
+
+    raise "Could not find available port in range #{@port}-#{max_port}"
+  end
+
+  def handle_request(client)
+    request_line = client.gets
+    return unless request_line
+
+    # Read headers
+    headers = {}
+    while (line = client.gets) && line != "\r\n"
+      key, value = line.split(': ', 2)
+      headers[key&.downcase] = value&.strip
+    end
+
+    # Read body
+    body = ''
+    if headers['content-length']
+      body = client.read(headers['content-length'].to_i)
+    end
+
+    method, path, = request_line.split(' ')
+    
+    response = route_request(method, path, body)
+    send_response(client, response[:status], response[:body])
+  rescue => e
+    log "HTTP request error: #{e.message}"
+    send_response(client, 500, { error: e.message }.to_json)
+  ensure
+    client&.close
+  end
+
+  def route_request(method, path, body)
+    case [method, path]
+    when ['GET', '/mcp-status']
+      {
+        status: 200,
+        body: {
+          client_id: CLIENT_ID,
+          name: CLIENT_NAME,
+          version: SERVER_VERSION,
+          port: @actual_port
+        }.to_json
+      }
+
+    when ['GET', '/pending-requests']
+      requests = $state_mutex.synchronize do
+        $pending_requests.map do |id, req|
+          {
+            request_id: id,
+            type: req[:type],
+            data: req[:data],
+            created_at: req[:created_at].iso8601
+          }
+        end
+      end
+      { status: 200, body: { requests: requests }.to_json }
+
+    when ['POST', '/respond']
+      handle_response_post(body)
+
+    when ['GET', '/health']
+      { status: 200, body: { status: 'ok' }.to_json }
+
+    else
+      { status: 404, body: { error: 'Not found' }.to_json }
+    end
+  end
+
+  def handle_response_post(body)
+    data = JSON.parse(body)
+    request_id = data['request_id']
+    response_data = data['response']
+
+    $state_mutex.synchronize do
+      unless $pending_requests.key?(request_id)
+        return { status: 404, body: { error: 'Request not found' }.to_json }
+      end
+
+      # Store the response
+      $responses[request_id] = response_data
+
+      # Signal the waiting thread
+      cond_data = $response_conditions[request_id]
+      if cond_data
+        cond_data[:mutex].synchronize do
+          cond_data[:condition].signal
+        end
+      end
+    end
+
+    log "Received response for request #{request_id[0..7]}"
+    { status: 200, body: { success: true }.to_json }
+  rescue JSON::ParserError => e
+    { status: 400, body: { error: "Invalid JSON: #{e.message}" }.to_json }
+  end
+
+  def send_response(client, status, body)
+    status_text = {
+      200 => 'OK',
+      400 => 'Bad Request', 
+      404 => 'Not Found',
+      500 => 'Internal Server Error'
+    }[status] || 'Unknown'
+
+    response = [
+      "HTTP/1.1 #{status} #{status_text}",
+      "Content-Type: application/json",
+      "Content-Length: #{body.bytesize}",
+      "Connection: close",
+      "Access-Control-Allow-Origin: *",
+      "",
+      body
+    ].join("\r\n")
+
+    client.write(response)
+  end
+end
+
 def main
   log "#{SERVER_NAME} v#{SERVER_VERSION} started"
-  log "Response server: #{RESPONSE_SERVER_HOST}:#{RESPONSE_SERVER_PORT}"
+  log "Client ID: #{CLIENT_ID}"
+  log "Client name: #{CLIENT_NAME}"
 
+  # Start the HTTP callback server
+  http_server = CallbackHTTPServer.new(CALLBACK_PORT)
+  http_server.start
+
+  # Handle graceful shutdown
+  %w[INT TERM].each do |signal|
+    Signal.trap(signal) do
+      log "Received #{signal}, shutting down..."
+      http_server.stop
+      exit 0
+    end
+  end
+
+  # Process MCP messages from stdin
   $stdin.each_line do |line|
     line = line.strip
     next if line.empty?
 
     begin
       request = JSON.parse(line)
-      response = handle_request(request)
-      send_response(response) if response
+      response = handle_mcp_request(request)
+      send_mcp_response(response) if response
     rescue JSON::ParserError => e
       log "JSON parse error: #{e.message}"
-      send_response({
+      send_mcp_response({
         jsonrpc: '2.0',
         id: nil,
-        error: {
-          code: -32700,
-          message: 'Parse error'
-        }
+        error: { code: -32700, message: 'Parse error' }
       })
     rescue => e
       log "Error: #{e.message}"
