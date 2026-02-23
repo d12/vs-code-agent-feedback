@@ -16,17 +16,19 @@ def detect_mcp_config_path
   when /darwin/
     # macOS - check both regular VS Code and Codespaces/Remote
     paths = [
+      File.expand_path('~/.vscode-server/data/Machine/mcp.json'), # Codespaces/Remote (check first)
       File.expand_path('~/Library/Application Support/Code/User/mcp.json'),
-      File.expand_path('~/.vscode-server/data/Machine/mcp.json'), # Codespaces/Remote
     ]
-    paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
+    # Prefer existing files, but fall back to first path where directory exists
+    paths.find { |p| File.exist?(p) } || paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
   when /linux/
-    # Linux - check both local and Codespaces/Remote
+    # Linux - check both Codespaces/Remote and local
     paths = [
+      File.expand_path('~/.vscode-remote/data/User/mcp.json'), # Codespaces/Remote (check first)
       File.expand_path('~/.config/Code/User/mcp.json'),
-      File.expand_path('~/.vscode-remote/data/User/mcp.json'), # Codespaces/Remote
     ]
-    paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
+    # Prefer existing files, but fall back to first path where directory exists
+    paths.find { |p| File.exist?(p) } || paths.find { |p| File.exist?(File.dirname(p)) } || paths.first
   when /mswin|mingw|cygwin/
     # Windows
     File.expand_path('~/AppData/Roaming/Code/User/mcp.json')
@@ -67,10 +69,11 @@ def print_manual_instructions
   puts colorize(JSON.pretty_generate(config), :cyan)
   puts ""
   puts "Typical mcp.json locations:"
-  puts "  macOS:      ~/Library/Application Support/Code/User/mcp.json"
-  puts "  Linux:      ~/.config/Code/User/mcp.json"
-  puts "  Windows:    %APPDATA%/Code/User/mcp.json"
-  puts "  Codespaces: ~/.vscode-server/data/Machine/mcp.json"
+  puts "  macOS:              ~/Library/Application Support/Code/User/mcp.json"
+  puts "  Linux:              ~/.config/Code/User/mcp.json"
+  puts "  Windows:            %APPDATA%/Code/User/mcp.json"
+  puts "  Remote (macOS):     ~/.vscode-server/data/Machine/mcp.json"
+  puts "  Remote (Linux):     ~/.vscode-remote/data/User/mcp.json"
   puts ""
 end
 
