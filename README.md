@@ -64,6 +64,12 @@ This system consists of two components:
 - Ruby 3.x (no additional gems required)
 - macOS (for notifications) or Linux with `notify-send`
 - VS Code with MCP support
+- **Optional (macOS)**: `terminal-notifier` for clickable notifications that focus Chrome
+
+```bash
+# Install terminal-notifier for best notification experience (macOS)
+brew install terminal-notifier
+```
 
 ## Quick Start
 
@@ -74,6 +80,11 @@ In a dedicated terminal that will remain open:
 ```bash
 ./bin/start-response-server
 ```
+
+**Notification modes:**
+- `./start-response-server` - Server notifications (default, uses terminal-notifier if installed)
+- `./start-response-server -n web` - Browser notifications only
+- `./start-response-server -n both` - Both server and browser notifications
 
 You should see:
 
@@ -115,6 +126,8 @@ Or manually add to your MCP server configuration:
   }
 }
 ```
+
+> **Note:** The server automatically detects your workspace folder via the MCP protocol and displays the git repository name (e.g., `owner/repo`) in the dashboard.
 
 ### 3. Configure Agent Instructions
 

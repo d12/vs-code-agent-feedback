@@ -19,14 +19,21 @@ require_relative 'lib/notifier'
 class ResponseServer
   DEFAULT_PORT = 18463
   MCP_PORT_RANGE = (14700..14715).freeze
-  POLL_INTERVAL = 2 # seconds
+  POLL_INTERVAL = 2 # seconds between each full port range scan
+  STALE_CLIENT_TIMEOUT = 15 # seconds - client is considered stale if not seen
+  NOTIFICATION_INTERVAL = 5 * 60 # 5 minutes
+  TIMEOUT_BUFFER = 10 # seconds before timeout to send auto-response
+  
+  # Notification modes: :server, :web, :both
+  attr_reader :notification_mode
 
-  def initialize(port: DEFAULT_PORT)
+  def initialize(port: DEFAULT_PORT, notification_mode: :server)
     @port = port
-    @notifier = Notifier.default
+    @notification_mode = notification_mode
+    @notifier = notification_mode == :web ? Notifier.null : Notifier.default
     @running = false
-    @clients = {} # client_id => { url:, name:, last_seen: }
-    @pending_requests = {} # request_id => { client_id:, type:, data:, created_at: }
+    @clients = {} # client_id => { url:, name:, last_seen:, timeout_seconds: }
+    @pending_requests = {} # request_id => { client_id:, type:, data:, created_at:, expires_at:, last_notified_at: }
     @responses = {} # request_id => response data
     @clients_mutex = Mutex.new
     @requests_mutex = Mutex.new
@@ -40,6 +47,7 @@ class ResponseServer
     puts "✓ Web server listening on http://localhost:#{@port}"
     puts "  Open this URL in your browser to manage agent requests"
     puts "  Polling ports #{MCP_PORT_RANGE.first}-#{MCP_PORT_RANGE.last} for MCP clients..."
+    puts "  Notification mode: #{@notification_mode}"
     puts "-" * 60
     puts
 
@@ -48,6 +56,9 @@ class ResponseServer
 
     # Start the client discovery thread
     @discovery_thread = Thread.new { discovery_loop }
+    
+    # Start the timeout and notification checker thread
+    @timeout_thread = Thread.new { timeout_and_notification_loop }
 
     while @running
       begin
@@ -64,6 +75,7 @@ class ResponseServer
   def stop
     @running = false
     @discovery_thread&.kill
+    @timeout_thread&.kill
     @server&.close
   end
 
@@ -101,6 +113,95 @@ class ResponseServer
       sleep POLL_INTERVAL
     end
   end
+  
+  # Timeout and notification checker loop
+  def timeout_and_notification_loop
+    while @running
+      now = Time.now
+      requests_to_timeout = []
+      requests_to_notify = []
+      
+      @requests_mutex.synchronize do
+        @pending_requests.each do |request_id, req|
+          next if @responses.key?(request_id) # Already responded
+          
+          # Check for timeout (respond just before it expires)
+          if req[:expires_at] && now >= (req[:expires_at] - TIMEOUT_BUFFER)
+            requests_to_timeout << request_id
+            next
+          end
+          
+          # Check if we need to send a reminder notification
+          if req[:last_notified_at] && (now - req[:last_notified_at]) >= NOTIFICATION_INTERVAL
+            requests_to_notify << request_id
+          end
+        end
+      end
+      
+      # Handle timeouts (auto-respond with "ask again" message)
+      requests_to_timeout.each do |request_id|
+        handle_timeout(request_id)
+      end
+      
+      # Send reminder notifications
+      requests_to_notify.each do |request_id|
+        send_reminder_notification(request_id)
+      end
+      
+      sleep 1 # Check every second for precision
+    end
+  end
+  
+  def handle_timeout(request_id)
+    @requests_mutex.synchronize do
+      req = @pending_requests[request_id]
+      return unless req
+      
+      client_id = req[:client_id]
+      client_info = @clients_mutex.synchronize { @clients[client_id] }
+      
+      if client_info
+        # Send auto-response asking to try again
+        timeout_response = {
+          'error' => 'Request timed out. The user did not respond in time. Please ask again if you still need approval or an answer.'
+        }
+        
+        begin
+          uri = URI("#{client_info[:url]}/respond")
+          http = Net::HTTP.new(uri.host, uri.port)
+          http.open_timeout = 5
+          http.read_timeout = 5
+          
+          post_request = Net::HTTP::Post.new(uri.path)
+          post_request['Content-Type'] = 'application/json'
+          post_request.body = {
+            request_id: request_id,
+            response: timeout_response
+          }.to_json
+          
+          http.request(post_request)
+          puts "[#{Time.now.strftime('%H:%M:%S')}] Auto-responded to timed out request #{request_id[0..7]}"
+        rescue => e
+          puts "[Timeout] Error sending timeout response: #{e.message}" if ENV['DEBUG']
+        end
+      end
+      
+      # Remove from pending requests
+      @pending_requests.delete(request_id)
+      @responses[request_id] = { 'timed_out' => true }
+    end
+  end
+  
+  def send_reminder_notification(request_id)
+    @requests_mutex.synchronize do
+      req = @pending_requests[request_id]
+      return unless req
+      
+      # Update last_notified_at so browser knows a reminder is due
+      req[:last_notified_at] = Time.now
+      puts "[#{Time.now.strftime('%H:%M:%S')}] Reminder due for request #{request_id[0..7]}"
+    end
+  end
 
   def check_port_for_client(port)
     uri = URI("http://127.0.0.1:#{port}/mcp-status")
@@ -121,7 +222,8 @@ class ResponseServer
           url: "http://127.0.0.1:#{port}",
           name: data['name'] || "CodeSpace #{client_id[0..7]}",
           last_seen: Time.now,
-          port: port
+          port: port,
+          timeout_seconds: data['timeout_seconds'] || 1800
         }
         
         if existing.nil?
@@ -133,7 +235,14 @@ class ResponseServer
       fetch_pending_requests(client_id, port)
     end
   rescue Errno::ECONNREFUSED, Errno::ETIMEDOUT, Net::OpenTimeout, Net::ReadTimeout, Errno::EHOSTUNREACH
-    # Port not responding, ignore
+    # Port not responding - check if we had a client there and mark as potentially offline
+    @clients_mutex.synchronize do
+      @clients.each do |id, info|
+        if info[:port] == port && (Time.now - info[:last_seen]) > 10
+          # Client hasn't responded in 10 seconds, may be offline
+        end
+      end
+    end
   rescue => e
     # Unexpected error, log but continue
     puts "[Discovery] Error checking port #{port}: #{e.message}" if ENV['DEBUG']
@@ -151,22 +260,32 @@ class ResponseServer
     if response.code == '200'
       data = JSON.parse(response.body)
       requests = data['requests'] || []
+      default_timeout = data['timeout_seconds'] || 1800
       
       @requests_mutex.synchronize do
         requests.each do |req|
           request_id = req['request_id']
           next if @pending_requests[request_id] # Already have this request
 
+          created_at = Time.parse(req['created_at'])
+          expires_at = req['expires_at'] ? Time.parse(req['expires_at']) : (created_at + default_timeout)
+          
           @pending_requests[request_id] = {
             client_id: client_id,
             type: req['type'],
             data: req['data'],
-            created_at: Time.parse(req['created_at'])
+            created_at: created_at,
+            expires_at: expires_at,
+            last_notified_at: Time.now # Track when we last notified
           }
 
-          # Send notification for new request
-          notify_new_request(req['type'], req['data'])
-          puts "[#{Time.now.strftime('%H:%M:%S')}] New #{req['type']} request from #{@clients[client_id][:name]}"
+          client_name = @clients[client_id][:name]
+          puts "[#{Time.now.strftime('%H:%M:%S')}] New #{req['type']} request from #{client_name}"
+          
+          # Send server-side notification if enabled
+          if @notification_mode == :server || @notification_mode == :both
+            notify_new_request(req['type'], req['data'], client_name)
+          end
         end
       end
     end
@@ -174,19 +293,20 @@ class ResponseServer
     puts "[Fetch] Error getting requests from port #{port}: #{e.message}" if ENV['DEBUG']
   end
 
-  def notify_new_request(type, data)
-    case type
-    when 'approval'
-      @notifier.notify(
-        title: '🤖 Agent Needs Approval',
-        message: 'An agent is waiting for your approval. Check the browser.'
-      )
-    when 'question'
-      @notifier.notify(
-        title: '❓ Agent Has a Question',
-        message: 'An agent is waiting for your answer. Check the browser.'
-      )
+  # Send OS-level notification for new requests
+  def notify_new_request(type, data, client_name)
+    title = type == 'approval' ? "Review needed: #{client_name}" : "Question from #{client_name}"
+    message = if type == 'approval'
+      (data['work_summary'] || '').slice(0, 150)
+    else
+      (data['question'] || '').slice(0, 150)
     end
+    
+    @notifier.notify(
+      title: title,
+      message: message,
+      url: "http://localhost:#{@port}"
+    )
   end
 
   def handle_client(client)
@@ -242,8 +362,8 @@ class ResponseServer
 
   def get_clients
     @clients_mutex.synchronize do
-      # Clean up stale clients (not seen in 30 seconds)
-      @clients.reject! { |_, v| Time.now - v[:last_seen] > 30 }
+      # Clean up stale clients (not seen recently)
+      @clients.reject! { |_, v| Time.now - v[:last_seen] > STALE_CLIENT_TIMEOUT }
       
       clients_list = @clients.map do |id, info|
         {
@@ -271,7 +391,9 @@ class ResponseServer
           data: req[:data],
           client_id: req[:client_id],
           client_name: client_name,
-          created_at: req[:created_at].iso8601
+          created_at: req[:created_at].iso8601,
+          expires_at: req[:expires_at]&.iso8601,
+          last_notified_at: req[:last_notified_at]&.iso8601
         }
       end
       
@@ -337,6 +459,7 @@ class ResponseServer
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Agent Approval Center</title>
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
         <style>
           * {
             box-sizing: border-box;
@@ -440,46 +563,37 @@ class ResponseServer
           }
           
           .status-bar {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
             margin-bottom: 24px;
-          }
-          
-          .status-card {
+            padding: 12px 16px;
             background: var(--bg-secondary);
             border-radius: var(--radius-md);
-            padding: 20px;
             border: 1px solid var(--border-light);
             box-shadow: var(--shadow-sm);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
+            flex-wrap: wrap;
           }
           
-          .status-card:hover {
-            transform: translateY(-2px);
-            box-shadow: var(--shadow-md);
-          }
-          
-          .status-card h3 {
+          .status-bar-label {
             font-size: 0.75rem;
             text-transform: uppercase;
             letter-spacing: 0.08em;
             color: var(--text-muted);
-            margin-bottom: 8px;
             font-weight: 600;
-          }
-          
-          .status-card .value {
-            font-size: 2rem;
-            font-weight: 700;
-            color: var(--text-primary);
           }
           
           .clients-list {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
-            margin-top: 12px;
+            align-items: center;
+          }
+          
+          .no-clients {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-style: italic;
           }
           
           .client-badge {
@@ -670,11 +784,182 @@ class ResponseServer
             border-radius: var(--radius-sm);
             font-size: 0.9rem;
             line-height: 1.7;
-            white-space: pre-wrap;
             max-height: 250px;
             overflow-y: auto;
             color: var(--text-primary);
             border: 1px solid var(--border-light);
+          }
+          
+          /* Markdown styling */
+          .markdown-body {
+            white-space: normal;
+          }
+          
+          .markdown-body p {
+            margin-bottom: 0.75em;
+          }
+          
+          .markdown-body p:last-child {
+            margin-bottom: 0;
+          }
+          
+          .markdown-body code {
+            background: var(--bg-secondary);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, 'Courier New', monospace;
+            font-size: 0.85em;
+            border: 1px solid var(--border-light);
+          }
+          
+          .markdown-body pre {
+            background: var(--bg-secondary);
+            padding: 12px;
+            border-radius: var(--radius-sm);
+            overflow-x: auto;
+            margin: 0.75em 0;
+            border: 1px solid var(--border-light);
+          }
+          
+          .markdown-body pre code {
+            background: none;
+            padding: 0;
+            border: none;
+          }
+          
+          .markdown-body ul, .markdown-body ol {
+            margin: 0.75em 0;
+            padding-left: 1.5em;
+          }
+          
+          .markdown-body li {
+            margin-bottom: 0.25em;
+          }
+          
+          .markdown-body h1, .markdown-body h2, .markdown-body h3, 
+          .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+            margin: 1em 0 0.5em;
+            font-weight: 600;
+          }
+          
+          .markdown-body h1:first-child, .markdown-body h2:first-child,
+          .markdown-body h3:first-child, .markdown-body h4:first-child {
+            margin-top: 0;
+          }
+          
+          .markdown-body strong {
+            font-weight: 600;
+          }
+          
+          .markdown-body a {
+            color: var(--accent-blue);
+            text-decoration: none;
+          }
+          
+          .markdown-body a:hover {
+            text-decoration: underline;
+          }
+          
+          .markdown-body blockquote {
+            border-left: 3px solid var(--border-medium);
+            padding-left: 1em;
+            margin: 0.75em 0;
+            color: var(--text-secondary);
+          }
+          
+          /* Diff viewer styles */
+          .diff-section {
+            margin-top: 16px;
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-sm);
+            overflow: hidden;
+          }
+          
+          .diff-summary {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            background: var(--bg-secondary);
+            cursor: pointer;
+            font-weight: 500;
+            user-select: none;
+          }
+          
+          .diff-summary:hover {
+            background: var(--bg-tertiary);
+          }
+          
+          .diff-summary::-webkit-details-marker {
+            margin-right: 8px;
+          }
+          
+          .diff-stats {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            font-weight: normal;
+          }
+          
+          .diff-content {
+            max-height: 500px;
+            overflow: auto;
+            background: #1e1e1e;
+          }
+          
+          .diff-view {
+            margin: 0;
+            padding: 16px;
+            font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Roboto Mono', monospace;
+            font-size: 12px;
+            line-height: 1.5;
+            white-space: pre;
+            overflow-x: auto;
+            color: #d4d4d4;
+          }
+          
+          .diff-view span {
+            display: block;
+          }
+          
+          .diff-header {
+            color: #569cd6;
+            font-weight: bold;
+            margin-top: 8px;
+          }
+          
+          .diff-header:first-child {
+            margin-top: 0;
+          }
+          
+          .diff-file {
+            color: #ce9178;
+            font-weight: bold;
+          }
+          
+          .diff-hunk {
+            color: #c586c0;
+            background: rgba(197, 134, 192, 0.1);
+            margin: 8px 0 4px 0;
+            padding: 2px 0;
+          }
+          
+          .diff-add {
+            color: #4ec9b0;
+            background: rgba(78, 201, 176, 0.15);
+          }
+          
+          .diff-del {
+            color: #f14c4c;
+            background: rgba(241, 76, 76, 0.15);
+          }
+          
+          .diff-context {
+            color: #d4d4d4;
+          }
+          
+          .diff-comment {
+            color: #6a9955;
+            font-style: italic;
           }
           
           .response-section {
@@ -794,6 +1079,90 @@ class ResponseServer
             animation: spin 0.8s linear infinite;
           }
           
+          .countdown-timer {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            background: var(--bg-accent);
+            color: var(--text-secondary);
+            border: 1px solid var(--border-light);
+          }
+          
+          .countdown-timer.warning {
+            background: #fef3c7;
+            color: #92400e;
+            border-color: #fcd34d;
+          }
+          
+          .countdown-timer.critical {
+            background: #fee2e2;
+            color: #991b1b;
+            border-color: #fca5a5;
+            animation: pulse-critical 1s ease-in-out infinite;
+          }
+          
+          @keyframes pulse-critical {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+          }
+          
+          .countdown-timer svg {
+            width: 14px;
+            height: 14px;
+          }
+          
+          /* Request selection styles */
+          .request-card.selected {
+            outline: 3px solid var(--accent-blue);
+            outline-offset: 2px;
+            box-shadow: var(--shadow-lg), 0 0 0 6px rgba(59, 130, 246, 0.1);
+          }
+          
+          /* Keyboard hints */
+          .keyboard-hints {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-light);
+            border-radius: var(--radius-md);
+            padding: 12px 16px;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            box-shadow: var(--shadow-md);
+            z-index: 100;
+          }
+          
+          .keyboard-hints h4 {
+            font-weight: 600;
+            margin-bottom: 8px;
+            color: var(--text-secondary);
+          }
+          
+          .keyboard-hints ul {
+            list-style: none;
+            margin: 0;
+            padding: 0;
+          }
+          
+          .keyboard-hints li {
+            margin-bottom: 4px;
+          }
+          
+          .keyboard-hints kbd {
+            background: var(--bg-tertiary);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.7rem;
+            border: 1px solid var(--border-light);
+            margin-right: 6px;
+          }
+          
           @media (max-width: 640px) {
             .container { padding: 16px; }
             header { padding: 24px 16px; }
@@ -812,14 +1181,9 @@ class ResponseServer
           </header>
           
           <div class="status-bar">
-            <div class="status-card">
-              <h3>Connected Clients</h3>
-              <div class="value" id="client-count">0</div>
-              <div class="clients-list" id="clients-list"></div>
-            </div>
-            <div class="status-card">
-              <h3>Pending Requests</h3>
-              <div class="value" id="request-count">0</div>
+            <span class="status-bar-label">Connected:</span>
+            <div class="clients-list" id="clients-list">
+              <span class="no-clients">No clients connected</span>
             </div>
           </div>
           
@@ -842,22 +1206,186 @@ class ResponseServer
           </footer>
         </div>
         
+        <!-- Keyboard hints -->
+        <div class="keyboard-hints" id="keyboard-hints">
+          <h4>⌨️ Keyboard Shortcuts</h4>
+          <ul>
+            <li><kbd>J</kbd> / <kbd>↓</kbd> Next request</li>
+            <li><kbd>K</kbd> / <kbd>↑</kbd> Previous request</li>
+            <li><kbd>A</kbd> Approve selected</li>
+            <li><kbd>R</kbd> / <kbd>Enter</kbd> Add feedback</li>
+            <li><kbd>S</kbd> Send feedback</li>
+            <li><kbd>D</kbd> Toggle diff</li>
+            <li><kbd>Esc</kbd> Unfocus / Deselect</li>
+            <li><kbd>?</kbd> Toggle hints</li>
+          </ul>
+        </div>
+        
         <script>
           const API_BASE = '';
+          const NOTIFICATION_MODE = '#{@notification_mode}'; // server, web, or both
           let lastRequestIds = new Set();
           let lastRequestsJson = '';
+          let selectedRequestIndex = -1;
+          let allRequests = [];
+          let lastNotifiedAt = {}; // Track when we last sent notification for each request
+          let isFirstFetch = true; // Don't notify on initial page load
+          const REMINDER_INTERVAL = 5 * 60 * 1000; // 5 minutes in ms
+          
+          // Request notification permission on load
+          if ('Notification' in window && Notification.permission === 'default') {
+            Notification.requestPermission();
+          }
+          
+          // Audio context for notification sound
+          let audioContext = null;
+          function playNotificationSound() {
+            try {
+              if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+              }
+              // Resume if suspended (browser policy)
+              if (audioContext.state === 'suspended') {
+                audioContext.resume();
+              }
+              // Create a short beep sound
+              const oscillator = audioContext.createOscillator();
+              const gainNode = audioContext.createGain();
+              oscillator.connect(gainNode);
+              gainNode.connect(audioContext.destination);
+              oscillator.frequency.value = 800;
+              oscillator.type = 'sine';
+              gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+              gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
+              oscillator.start(audioContext.currentTime);
+              oscillator.stop(audioContext.currentTime + 0.3);
+            } catch (e) {
+              console.log('Could not play notification sound:', e);
+            }
+          }
+          
+          // Flash the tab title when there are pending requests
+          let originalTitle = document.title;
+          let titleFlashInterval = null;
+          
+          function startTitleFlash(count) {
+            if (titleFlashInterval) return;
+            let showAlert = true;
+            titleFlashInterval = setInterval(() => {
+              document.title = showAlert ? `(${count}) 🔔 Action Required!` : originalTitle;
+              showAlert = !showAlert;
+            }, 1000);
+          }
+          
+          function stopTitleFlash() {
+            if (titleFlashInterval) {
+              clearInterval(titleFlashInterval);
+              titleFlashInterval = null;
+              document.title = originalTitle;
+            }
+          }
+          
+          function sendBrowserNotification(title, body, requestId) {
+            // Only send browser notifications if mode is 'web' or 'both'
+            if (NOTIFICATION_MODE === 'server') {
+              console.log('Skipping browser notification (server mode)');
+              return;
+            }
+            
+            // Play sound immediately
+            playNotificationSound();
+            
+            if ('Notification' in window && Notification.permission === 'granted') {
+              console.log('Sending browser notification:', title);
+              const notification = new Notification(title, {
+                body: body,
+                icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🤖</text></svg>',
+                tag: requestId || 'agent-request', // Unique tag per request
+                renotify: true, // Force notification even with same tag
+                requireInteraction: true, // Keep notification visible until clicked
+                silent: false, // Allow sound
+                vibrate: [200, 100, 200] // Vibration pattern for mobile
+              });
+              notification.onclick = () => {
+                window.focus();
+                notification.close();
+              };
+            } else {
+              console.log('Cannot send notification - permission:', Notification.permission);
+            }
+          }
+          
+          function formatText(text) {
+            // Escape HTML and convert newlines to <br> for proper formatting
+            return escapeHtml(text || '').split(String.fromCharCode(10)).join('<br>');
+          }
+          
+          function renderMarkdown(text) {
+            if (!text) return '';
+            try {
+              // Configure marked for safe rendering
+              marked.setOptions({
+                breaks: true,
+                gfm: true
+              });
+              return marked.parse(text);
+            } catch (e) {
+              // Fallback to escaped text if marked fails
+              return escapeHtml(text);
+            }
+          }
+          
+          function renderDiff(diff) {
+            if (!diff) return '';
+            const lines = diff.split(String.fromCharCode(10));
+            return lines.map(line => {
+              const escaped = escapeHtml(line);
+              if (line.startsWith('+++') || line.startsWith('---')) {
+                return `<span class="diff-file">${escaped}</span>`;
+              } else if (line.startsWith('@@')) {
+                return `<span class="diff-hunk">${escaped}</span>`;
+              } else if (line.startsWith('+')) {
+                return `<span class="diff-add">${escaped}</span>`;
+              } else if (line.startsWith('-')) {
+                return `<span class="diff-del">${escaped}</span>`;
+              } else if (line.startsWith('diff ')) {
+                return `<span class="diff-header">${escaped}</span>`;
+              } else if (line.startsWith('#')) {
+                return `<span class="diff-comment">${escaped}</span>`;
+              }
+              return `<span class="diff-context">${escaped}</span>`;
+            }).join(String.fromCharCode(10));
+          }
+          
+          function getDiffStats(diff) {
+            if (!diff) return '';
+            const lines = diff.split(String.fromCharCode(10));
+            let additions = 0, deletions = 0, files = 0;
+            lines.forEach(line => {
+              if (line.startsWith('+') && !line.startsWith('+++')) additions++;
+              else if (line.startsWith('-') && !line.startsWith('---')) deletions++;
+              else if (line.startsWith('diff ')) files++;
+            });
+            const parts = [];
+            if (files > 0) parts.push(`${files} file${files !== 1 ? 's' : ''}`);
+            if (additions > 0) parts.push(`+${additions}`);
+            if (deletions > 0) parts.push(`-${deletions}`);
+            return parts.join(', ');
+          }
           
           async function fetchClients() {
             try {
               const res = await fetch(API_BASE + '/api/clients');
               const data = await res.json();
               
-              document.getElementById('client-count').textContent = data.clients.length;
-              
               const clientsList = document.getElementById('clients-list');
-              clientsList.innerHTML = data.clients.map(c => 
-                `<span class="client-badge">${escapeHtml(c.name)}</span>`
-              ).join('');
+              if (data.clients.length === 0) {
+                clientsList.innerHTML = '<span class="no-clients">No clients connected</span>';
+              } else {
+                clientsList.innerHTML = data.clients.map(c => 
+                  `<span class="client-badge">${escapeHtml(c.name)}</span>`
+                ).join('');
+              }
             } catch (e) {
               console.error('Error fetching clients:', e);
             }
@@ -868,7 +1396,64 @@ class ResponseServer
               const res = await fetch(API_BASE + '/api/requests');
               const data = await res.json();
               
-              document.getElementById('request-count').textContent = data.requests.length;
+              const currentIds = new Set(data.requests.map(r => r.id));
+              const now = Date.now();
+              
+              // Start or stop title flashing based on pending requests
+              if (data.requests.length > 0 && !document.hasFocus()) {
+                startTitleFlash(data.requests.length);
+              } else if (data.requests.length === 0) {
+                stopTitleFlash();
+              }
+              
+              // Check for new requests and send browser notifications (skip first fetch)
+              if (!isFirstFetch) {
+                for (const req of data.requests) {
+                  // New request notification
+                  if (!lastRequestIds.has(req.id)) {
+                    const repoName = req.client_name || 'Unknown';
+                    const title = req.type === 'approval' 
+                      ? `Review needed for ${repoName}`
+                      : `Question from ${repoName}`;
+                    const body = req.type === 'approval' 
+                      ? (req.data?.work_summary || '').substring(0, 150)
+                      : (req.data?.question || '').substring(0, 150);
+                    sendBrowserNotification(title, body, req.id);
+                    lastNotifiedAt[req.id] = now;
+                  }
+                  // Reminder notification (every 5 minutes)
+                  else if (lastNotifiedAt[req.id] && (now - lastNotifiedAt[req.id]) >= REMINDER_INTERVAL) {
+                    const repoName = req.client_name || 'Unknown';
+                    const remaining = req.expires_at ? Math.round((new Date(req.expires_at) - now) / 60000) : '?';
+                    const title = `⏰ Still waiting: ${repoName}`;
+                    const body = `${remaining} minutes remaining`;
+                    sendBrowserNotification(title, body, req.id + '-reminder');
+                    lastNotifiedAt[req.id] = now;
+                  }
+                }
+              } else {
+                // On first fetch, just record current IDs without notifying
+                for (const req of data.requests) {
+                  lastNotifiedAt[req.id] = now;
+                }
+                isFirstFetch = false;
+              }
+              
+              // Stop title flash when window is focused
+              window.addEventListener('focus', stopTitleFlash);
+              
+              lastRequestIds = currentIds;
+              
+              // Clean up old notification timestamps
+              for (const id of Object.keys(lastNotifiedAt)) {
+                if (!currentIds.has(id)) {
+                  delete lastNotifiedAt[id];
+                }
+              }
+              
+              // Store all requests for keyboard navigation
+              allRequests = data.requests;
+              
               document.getElementById('request-badge').textContent = 
                 data.requests.length === 0 ? '0 waiting' : 
                 data.requests.length === 1 ? '1 waiting' : 
@@ -934,64 +1519,88 @@ class ResponseServer
           }
           
           function renderRequest(req) {
+            const countdownHtml = req.expires_at ? 
+              `<span class="countdown-timer" data-expires="${req.expires_at}" id="timer-${req.id}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <circle cx="12" cy="12" r="10"></circle>
+                  <polyline points="12 6 12 12 16 14"></polyline>
+                </svg>
+                <span class="countdown-value">--:--</span>
+              </span>` : '';
+            
             if (req.type === 'approval') {
               return `
-                <div class="request-card approval" data-id="${req.id}">
+                <div class="request-card approval" data-id="${req.id}" data-expires="${req.expires_at || ''}">
                   <div class="request-header">
                     <div class="request-type">
                       <span class="badge approval">Approval Request</span>
                       <span class="request-meta">from ${escapeHtml(req.client_name)}</span>
                     </div>
-                    <span class="request-meta">${formatTime(req.created_at)}</span>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                      ${countdownHtml}
+                    </div>
                   </div>
                   <div class="request-content">
                     <div class="content-section">
                       <h4>📋 Work Summary</h4>
-                      <div class="text">${escapeHtml(req.data.work_summary)}</div>
+                      <div class="text markdown-body">${renderMarkdown(req.data.work_summary)}</div>
                     </div>
                     <div class="content-section">
                       <h4>🧪 Testing Instructions</h4>
-                      <div class="text">${escapeHtml(req.data.testing_instructions)}</div>
+                      <div class="text markdown-body">${renderMarkdown(req.data.testing_instructions)}</div>
                     </div>
+                    ${req.data.git_diff ? `
+                    <details class="diff-section">
+                      <summary class="diff-summary">
+                        <span>📝 Git Diff</span>
+                        <span class="diff-stats">${getDiffStats(req.data.git_diff)}</span>
+                      </summary>
+                      <div class="diff-content">
+                        <pre class="diff-view">${renderDiff(req.data.git_diff)}</pre>
+                      </div>
+                    </details>
+                    ` : ''}
                   </div>
                   <div class="response-section">
                     <div class="response-buttons">
-                      <button class="btn btn-approve" onclick="approveRequest('${req.id}')">✓ Approve</button>
-                      <button class="btn btn-reject" onclick="showFeedback('${req.id}')">✗ Request Changes</button>
+                      <button class="btn btn-approve" onclick="approveRequest('${req.id}')">✓ Approve [A]</button>
+                      <button class="btn btn-reject" onclick="showFeedback('${req.id}')">✗ Request Changes [R]</button>
                     </div>
                     <div class="feedback-area" id="feedback-${req.id}">
                       <textarea id="feedback-text-${req.id}" placeholder="Enter your feedback for the agent..."></textarea>
-                      <button class="btn btn-submit" onclick="rejectRequest('${req.id}')">Send Feedback</button>
+                      <button class="btn btn-submit" onclick="rejectRequest('${req.id}')">Send [S]</button>
                     </div>
                   </div>
                 </div>
               `;
             } else if (req.type === 'question') {
               return `
-                <div class="request-card question" data-id="${req.id}">
+                <div class="request-card question" data-id="${req.id}" data-expires="${req.expires_at || ''}">
                   <div class="request-header">
                     <div class="request-type">
                       <span class="badge question">Question</span>
                       <span class="request-meta">from ${escapeHtml(req.client_name)}</span>
                     </div>
-                    <span class="request-meta">${formatTime(req.created_at)}</span>
+                    <div style="display: flex; align-items: center; gap: 12px;">
+                      ${countdownHtml}
+                    </div>
                   </div>
                   <div class="request-content">
                     <div class="content-section">
                       <h4>❓ Question</h4>
-                      <div class="text">${escapeHtml(req.data.question)}</div>
+                      <div class="text markdown-body">${renderMarkdown(req.data.question)}</div>
                     </div>
                     ${req.data.context ? `
                       <div class="content-section">
                         <h4>📋 Context</h4>
-                        <div class="text">${escapeHtml(req.data.context)}</div>
+                        <div class="text markdown-body">${renderMarkdown(req.data.context)}</div>
                       </div>
                     ` : ''}
                   </div>
                   <div class="response-section">
                     <div class="answer-area">
                       <textarea id="answer-text-${req.id}" placeholder="Enter your answer..."></textarea>
-                      <button class="btn btn-submit" onclick="answerQuestion('${req.id}')">Send Answer</button>
+                      <button class="btn btn-submit" onclick="answerQuestion('${req.id}')">Send Answer [S]</button>
                     </div>
                   </div>
                 </div>
@@ -1012,7 +1621,22 @@ class ResponseServer
           }
           
           function showFeedback(requestId) {
-            document.getElementById('feedback-' + requestId).classList.add('visible');
+            const feedbackArea = document.getElementById('feedback-' + requestId);
+            feedbackArea.classList.add('visible');
+            
+            // Auto-focus the textarea
+            const textarea = document.getElementById('feedback-text-' + requestId);
+            if (textarea) {
+              textarea.focus();
+            }
+            
+            // Scroll the card into view so button is fully visible
+            const card = feedbackArea.closest('.request-card');
+            if (card) {
+              setTimeout(() => {
+                card.scrollIntoView({ behavior: 'smooth', block: 'end' });
+              }, 100);
+            }
           }
           
           async function approveRequest(requestId) {
@@ -1056,13 +1680,222 @@ class ResponseServer
             }
           }
           
+          // Update countdown timers
+          function updateCountdowns() {
+            document.querySelectorAll('.countdown-timer').forEach(timer => {
+              const expiresAt = timer.dataset.expires;
+              if (!expiresAt) return;
+              
+              const expires = new Date(expiresAt);
+              const now = new Date();
+              const remainingMs = expires - now;
+              
+              const valueEl = timer.querySelector('.countdown-value');
+              if (!valueEl) return;
+              
+              if (remainingMs <= 0) {
+                valueEl.textContent = 'Expired';
+                timer.classList.add('critical');
+                timer.classList.remove('warning');
+              } else {
+                const totalSeconds = Math.floor(remainingMs / 1000);
+                const minutes = Math.floor(totalSeconds / 60);
+                const seconds = totalSeconds % 60;
+                
+                valueEl.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+                
+                // Add warning/critical classes based on time remaining
+                timer.classList.remove('warning', 'critical');
+                if (minutes < 2) {
+                  timer.classList.add('critical');
+                } else if (minutes < 5) {
+                  timer.classList.add('warning');
+                }
+              }
+            });
+          }
+          
+          // Selection management
+          function selectRequest(index) {
+            // Remove previous selection
+            document.querySelectorAll('.request-card.selected').forEach(el => el.classList.remove('selected'));
+            
+            if (index < 0 || index >= allRequests.length) {
+              selectedRequestIndex = -1;
+              return;
+            }
+            
+            selectedRequestIndex = index;
+            const card = document.querySelector(`.request-card[data-id="${allRequests[index].id}"]`);
+            if (card) {
+              card.classList.add('selected');
+              card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+          }
+          
+          function getSelectedRequest() {
+            if (selectedRequestIndex >= 0 && selectedRequestIndex < allRequests.length) {
+              return allRequests[selectedRequestIndex];
+            }
+            return null;
+          }
+          
+          // Keyboard handling
+          document.addEventListener('keydown', (e) => {
+            const activeElement = document.activeElement;
+            const isTyping = activeElement?.tagName === 'TEXTAREA' || activeElement?.tagName === 'INPUT';
+            
+            // Handle Escape - unfocus if typing, otherwise deselect
+            // Important: only blur OR deselect, never both on same keypress
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              if (isTyping) {
+                // Just blur the input - keep the request selected so user can hit 'S' to send
+                activeElement.blur();
+              } else if (selectedRequestIndex >= 0) {
+                // Not typing - deselect the request
+                selectRequest(-1);
+                // Also hide any open feedback areas
+                document.querySelectorAll('.feedback-area.visible').forEach(fa => fa.classList.remove('visible'));
+              }
+              return;
+            }
+            
+            // Don't handle other shortcuts while typing
+            if (isTyping) {
+              // Ctrl/Cmd+Enter to submit from textarea
+              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                e.preventDefault();
+                const textarea = document.activeElement;
+                const card = textarea.closest('.request-card');
+                if (card) {
+                  const requestId = card.dataset.id;
+                  const isQuestion = card.classList.contains('question');
+                  if (isQuestion) {
+                    answerQuestion(requestId);
+                  } else {
+                    rejectRequest(requestId);
+                  }
+                }
+              }
+              return;
+            }
+            
+            // Navigation
+            if (e.key === 'j' || e.key === 'ArrowDown') {
+              e.preventDefault();
+              if (allRequests.length > 0) {
+                selectRequest(Math.min(selectedRequestIndex + 1, allRequests.length - 1));
+              }
+              return;
+            }
+            
+            if (e.key === 'k' || e.key === 'ArrowUp') {
+              e.preventDefault();
+              if (allRequests.length > 0) {
+                selectRequest(Math.max(selectedRequestIndex - 1, 0));
+              }
+              return;
+            }
+            
+            // Quick approve
+            if (e.key === 'a') {
+              e.preventDefault();
+              const selected = getSelectedRequest();
+              if (selected) {
+                approveRequest(selected.id);
+              }
+              return;
+            }
+            
+            // Show feedback / answer area
+            if (e.key === 'r' || e.key === 'Enter') {
+              e.preventDefault();
+              const selected = getSelectedRequest();
+              if (selected) {
+                const card = document.querySelector(`.request-card[data-id="${selected.id}"]`);
+                if (card) {
+                  const isQuestion = card.classList.contains('question');
+                  if (isQuestion) {
+                    // Focus answer textarea
+                    const textarea = card.querySelector('textarea');
+                    if (textarea) textarea.focus();
+                  } else {
+                    // Show feedback area and focus
+                    showFeedback(selected.id);
+                  }
+                }
+              } else if (allRequests.length > 0 && e.key === 'Enter') {
+                // Select first if none selected
+                selectRequest(0);
+              }
+              return;
+            }
+            
+            // Send feedback (S key)
+            if (e.key === 's') {
+              e.preventDefault();
+              const selected = getSelectedRequest();
+              if (selected) {
+                const card = document.querySelector(`.request-card[data-id="${selected.id}"]`);
+                if (card) {
+                  const isQuestion = card.classList.contains('question');
+                  if (isQuestion) {
+                    answerQuestion(selected.id);
+                  } else {
+                    rejectRequest(selected.id);
+                  }
+                }
+              }
+              return;
+            }
+            
+            // Toggle diff (D key)
+            if (e.key === 'd') {
+              e.preventDefault();
+              const selected = getSelectedRequest();
+              if (selected) {
+                const card = document.querySelector(`.request-card[data-id="${selected.id}"]`);
+                if (card) {
+                  const details = card.querySelector('.diff-section');
+                  if (details) {
+                    details.open = !details.open;
+                  }
+                }
+              }
+              return;
+            }
+            
+            // Toggle keyboard hints
+            if (e.key === '?') {
+              e.preventDefault();
+              const hints = document.getElementById('keyboard-hints');
+              hints.style.display = hints.style.display === 'none' ? 'block' : 'none';
+              return;
+            }
+            
+            // Select first request if none selected and navigating
+            if (allRequests.length > 0 && selectedRequestIndex < 0) {
+              if (['j', 'k', 'ArrowDown', 'ArrowUp'].includes(e.key)) {
+                selectRequest(0);
+              }
+            }
+          });
+          
           // Poll for updates
-          setInterval(fetchClients, 3000);
+          setInterval(fetchClients, 2000);
           setInterval(fetchRequests, 2000);
+          setInterval(updateCountdowns, 1000); // Update timers every second
           
           // Initial fetch
           fetchClients();
           fetchRequests();
+          setTimeout(updateCountdowns, 100); // Initial countdown update
+          
+          // Rapid initial client polling to catch name updates quickly
+          setTimeout(fetchClients, 500);
+          setTimeout(fetchClients, 1000);
+          setTimeout(fetchClients, 1500);
         </script>
       </body>
       </html>
@@ -1095,8 +1928,39 @@ end
 
 # Main entry point
 if __FILE__ == $PROGRAM_NAME
-  port = (ARGV[0] || ENV['RESPONSE_SERVER_PORT'] || ResponseServer::DEFAULT_PORT).to_i
+  require 'optparse'
+  
+  options = {
+    port: (ENV['RESPONSE_SERVER_PORT'] || ResponseServer::DEFAULT_PORT).to_i,
+    notification_mode: (ENV['NOTIFICATION_MODE'] || 'server').to_sym
+  }
+  
+  OptionParser.new do |opts|
+    opts.banner = "Usage: #{$PROGRAM_NAME} [options]"
+    
+    opts.on('-p', '--port PORT', Integer, "Port to listen on (default: #{ResponseServer::DEFAULT_PORT})") do |p|
+      options[:port] = p
+    end
+    
+    opts.on('-n', '--notifications MODE', [:server, :web, :both],
+            'Notification mode: server, web, or both (default: server)',
+            '  server - OS notifications that focus Chrome when clicked',
+            '  web    - Browser notifications only',
+            '  both   - Both server and browser notifications') do |mode|
+      options[:notification_mode] = mode
+    end
+    
+    opts.on('-h', '--help', 'Show this help') do
+      puts opts
+      exit
+    end
+  end.parse!
+  
+  # Legacy positional argument support
+  if ARGV[0] && options[:port] == ResponseServer::DEFAULT_PORT
+    options[:port] = ARGV[0].to_i
+  end
 
-  server = ResponseServer.new(port: port)
+  server = ResponseServer.new(port: options[:port], notification_mode: options[:notification_mode])
   server.start
 end

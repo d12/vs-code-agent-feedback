@@ -9,18 +9,180 @@ require 'json'
 require 'socket'
 require 'securerandom'
 require 'time'
+require 'uri'
 
 # Configuration
 CALLBACK_PORT = (ENV['MCP_CALLBACK_PORT'] || 14700).to_i
-REQUEST_TIMEOUT = (ENV['APPROVAL_TIMEOUT'] || 600).to_i # 10 minutes default
+REQUEST_TIMEOUT = (ENV['APPROVAL_TIMEOUT'] || 60 * 30).to_i # 30 minutes default
 
 # Server information
 SERVER_NAME = 'get-user-approval'
 SERVER_VERSION = '2.0.0'
 
+# Get git repo name for better client identification
+def get_git_repo_name(workspace_dir)
+  return nil unless workspace_dir && !workspace_dir.empty?
+  
+  begin
+    # Get the remote URL first (most reliable for repo name)
+    remote_url = `git -C "#{workspace_dir}" config --get remote.origin.url 2>/dev/null`.strip
+    if remote_url && !remote_url.empty?
+      # Extract repo name from URL (handles both HTTPS and SSH formats)
+      # Examples:
+      # https://github.com/user/repo.git -> user/repo
+      # git@github.com:user/repo.git -> user/repo
+      if remote_url =~ %r{[/:]([^/]+?)/([^/]+?)(?:\.git)?$}
+        return "#{$1}/#{$2}".sub(/\.git$/, '')
+      end
+    end
+    
+    # Fallback: get the root directory name
+    root_dir = `git -C "#{workspace_dir}" rev-parse --show-toplevel 2>/dev/null`.strip
+    if root_dir && !root_dir.empty?
+      return File.basename(root_dir)
+    end
+  rescue => e
+    # Git not available or not in a git repo
+  end
+  nil
+end
+
+# Get the current git diff for the workspace
+def get_git_diff(workspace_dir)
+  return nil unless workspace_dir && !workspace_dir.empty?
+  
+  begin
+    # Check if we're in a git repo
+    git_root = `git -C "#{workspace_dir}" rev-parse --show-toplevel 2>/dev/null`.strip
+    return nil if git_root.empty?
+    
+    # Get diff of staged and unstaged changes
+    # --no-color ensures clean output
+    diff = `git -C "#{git_root}" diff HEAD --no-color 2>/dev/null`.strip
+    
+    # If no changes against HEAD, try just unstaged changes
+    if diff.empty?
+      diff = `git -C "#{git_root}" diff --no-color 2>/dev/null`.strip
+    end
+    
+    # Include untracked files with full content (like GitHub PR view)
+    untracked = `git -C "#{git_root}" ls-files --others --exclude-standard 2>/dev/null`.strip
+    unless untracked.empty?
+      untracked_files = untracked.split("\n")
+      untracked_diffs = untracked_files.map do |file|
+        file_path = File.join(git_root, file)
+        next nil unless File.exist?(file_path) && File.file?(file_path)
+        
+        # Skip binary files
+        begin
+          content = File.read(file_path, encoding: 'UTF-8')
+          # Check if file appears to be binary
+          if content.include?("\x00") || !content.valid_encoding?
+            next "diff --git a/#{file} b/#{file}\nnew file mode 100644\nBinary file"
+          end
+          
+          lines = content.split("\n", -1)
+          line_count = lines.length
+          
+          # Format like a git diff for a new file
+          header = "diff --git a/#{file} b/#{file}\n"
+          header += "new file mode 100644\n"
+          header += "--- /dev/null\n"
+          header += "+++ b/#{file}\n"
+          header += "@@ -0,0 +1,#{line_count} @@\n"
+          
+          # Add all lines as additions
+          diff_content = lines.map { |line| "+#{line}" }.join("\n")
+          
+          header + diff_content
+        rescue => e
+          "diff --git a/#{file} b/#{file}\nnew file mode 100644\n# Error reading file: #{e.message}"
+        end
+      end.compact
+      
+      if untracked_diffs.any?
+        diff = diff.empty? ? untracked_diffs.join("\n\n") : diff + "\n\n" + untracked_diffs.join("\n\n")
+      end
+    end
+    
+    return nil if diff.empty?
+    diff
+  rescue => e
+    log "Error getting git diff: #{e.message}"
+    nil
+  end
+end
+
+# Workspace directory can be passed via:
+# 1. First argument (from VS Code ${workspaceFolder})
+# 2. Environment variable MCP_WORKSPACE_DIR (preferred - set via env in mcp.json)
+# 3. MCP roots/list request (automatic, after initialization)
+# 4. Falls back to current directory
+def resolve_workspace_dir
+  # Check argument first
+  if ARGV[0] && !ARGV[0].empty? && !ARGV[0].start_with?('${')
+    return ARGV[0]
+  end
+  
+  # Check environment variable (VS Code sets this via env config)
+  env_workspace = ENV['MCP_WORKSPACE_DIR']
+  if env_workspace && !env_workspace.empty? && !env_workspace.start_with?('${')
+    return env_workspace
+  end
+  
+  # Fallback to current directory
+  Dir.pwd
+end
+
+# Mutable client state (can be updated after roots/list response)
+module ClientState
+  class << self
+    attr_accessor :workspace_dir, :client_name, :pending_requests
+    
+    def initialize!
+      @workspace_dir = resolve_workspace_dir
+      @client_name = compute_client_name(@workspace_dir)
+      @pending_requests = {} # For tracking outgoing requests (like roots/list)
+      @request_id_counter = 0
+    end
+    
+    def next_request_id
+      @request_id_counter += 1
+      "server-#{@request_id_counter}"
+    end
+    
+    def compute_client_name(workspace)
+      git_name = get_git_repo_name(workspace)
+      git_name || ENV['CODESPACE_NAME'] || ENV['MCP_CLIENT_NAME'] || "local-#{CLIENT_ID[0..7]}"
+    end
+    
+    def update_from_roots(roots)
+      return if roots.nil? || roots.empty?
+      
+      # Use the first root's URI
+      root = roots.first
+      uri = root['uri'] || root[:uri]
+      return unless uri
+      
+      # Convert file:// URI to path
+      if uri.start_with?('file://')
+        path = URI.decode_www_form_component(uri.sub('file://', ''))
+        @workspace_dir = path
+        new_name = compute_client_name(path)
+        if new_name != @client_name
+          @client_name = new_name
+          log "Updated client name from roots: #{@client_name}"
+        end
+      end
+    end
+  end
+end
+
 # Generate a unique client ID for this instance
 CLIENT_ID = SecureRandom.uuid
-CLIENT_NAME = ENV['CODESPACE_NAME'] || ENV['MCP_CLIENT_NAME'] || "local-#{CLIENT_ID[0..7]}"
+
+# Initialize client state
+ClientState.initialize!
 
 # Tool definitions
 TOOLS = [
@@ -87,7 +249,9 @@ def log(message)
   $stderr.flush
 end
 
-def handle_initialize(id, _params)
+def handle_initialize(id, params)
+  # Log initialize params to see what VS Code sends
+  log "Initialize params: #{params.inspect}"
   {
     jsonrpc: '2.0',
     id: id,
@@ -139,14 +303,14 @@ def create_request_and_wait(type, data)
     while response.nil? && Time.now < deadline
       remaining = deadline - Time.now
       break if remaining <= 0
-      
+
       # Check if response has arrived
       $state_mutex.synchronize do
         response = $responses.delete(request_id)
       end
-      
+
       break if response
-      
+
       # Wait with timeout
       condition.wait(mutex, [remaining, 1].min)
     end
@@ -196,9 +360,13 @@ def handle_tools_call(id, params)
       }
     end
 
+    # Collect git diff from the workspace
+    git_diff = get_git_diff(ClientState.workspace_dir)
+
     result = create_request_and_wait('approval', {
       work_summary: work_summary,
-      testing_instructions: testing_instructions
+      testing_instructions: testing_instructions,
+      git_diff: git_diff
     })
 
     if result['error']
@@ -297,10 +465,18 @@ def handle_mcp_request(request)
   id = request['id']
   params = request['params'] || {}
 
+  # Check if this is a response to one of our requests (like roots/list)
+  if request.key?('result') || request.key?('error')
+    handle_client_response(request)
+    return nil
+  end
+
   case method
   when 'initialize'
     handle_initialize(id, params)
   when 'notifications/initialized'
+    # After initialization, request roots to get workspace folder
+    request_roots_list
     nil # No response needed for notifications
   when 'tools/list'
     handle_tools_list(id, params)
@@ -316,6 +492,38 @@ def handle_mcp_request(request)
         error: { code: -32601, message: "Method not found: #{method}" }
       }
     end
+  end
+end
+
+# Send a request to the client to list roots (workspace folders)
+def request_roots_list
+  request_id = ClientState.next_request_id
+  ClientState.pending_requests[request_id] = 'roots/list'
+  
+  request = {
+    jsonrpc: '2.0',
+    id: request_id,
+    method: 'roots/list'
+  }
+  send_mcp_response(request)
+end
+
+# Handle responses from the client (for requests we sent)
+def handle_client_response(response)
+  request_id = response['id']
+  pending_method = ClientState.pending_requests.delete(request_id)
+  
+  return unless pending_method
+  
+  if response['error']
+    log "Client returned error for #{pending_method}: #{response['error']['message']}"
+    return
+  end
+  
+  case pending_method
+  when 'roots/list'
+    roots = response.dig('result', 'roots')
+    ClientState.update_from_roots(roots)
   end
 end
 
@@ -335,7 +543,7 @@ class CallbackHTTPServer
     @running = true
 
     log "HTTP callback server listening on port #{@actual_port}"
-    
+
     Thread.new do
       while @running
         begin
@@ -396,7 +604,7 @@ class CallbackHTTPServer
     end
 
     method, path, = request_line.split(' ')
-    
+
     response = route_request(method, path, body)
     send_response(client, response[:status], response[:body])
   rescue => e
@@ -413,24 +621,28 @@ class CallbackHTTPServer
         status: 200,
         body: {
           client_id: CLIENT_ID,
-          name: CLIENT_NAME,
+          name: ClientState.client_name,
           version: SERVER_VERSION,
-          port: @actual_port
+          port: @actual_port,
+          timeout_seconds: REQUEST_TIMEOUT
         }.to_json
       }
 
     when ['GET', '/pending-requests']
       requests = $state_mutex.synchronize do
         $pending_requests.map do |id, req|
+          expires_at = req[:created_at] + REQUEST_TIMEOUT
           {
             request_id: id,
             type: req[:type],
             data: req[:data],
-            created_at: req[:created_at].iso8601
+            created_at: req[:created_at].iso8601,
+            expires_at: expires_at.iso8601,
+            timeout_seconds: REQUEST_TIMEOUT
           }
         end
       end
-      { status: 200, body: { requests: requests }.to_json }
+      { status: 200, body: { requests: requests, timeout_seconds: REQUEST_TIMEOUT }.to_json }
 
     when ['POST', '/respond']
       handle_response_post(body)
@@ -474,7 +686,7 @@ class CallbackHTTPServer
   def send_response(client, status, body)
     status_text = {
       200 => 'OK',
-      400 => 'Bad Request', 
+      400 => 'Bad Request',
       404 => 'Not Found',
       500 => 'Internal Server Error'
     }[status] || 'Unknown'
@@ -496,7 +708,8 @@ end
 def main
   log "#{SERVER_NAME} v#{SERVER_VERSION} started"
   log "Client ID: #{CLIENT_ID}"
-  log "Client name: #{CLIENT_NAME}"
+  log "Initial workspace: #{ClientState.workspace_dir}"
+  log "Initial client name: #{ClientState.client_name}"
 
   # Start the HTTP callback server
   http_server = CallbackHTTPServer.new(CALLBACK_PORT)
