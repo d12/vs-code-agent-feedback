@@ -7,7 +7,7 @@ require 'json'
 require 'fileutils'
 
 SCRIPT_DIR = File.dirname(File.realpath(__FILE__))
-PROJECT_DIR = File.dirname(SCRIPT_DIR)
+PROJECT_DIR = SCRIPT_DIR  # Script is at project root
 MCP_SERVER_PATH = File.join(PROJECT_DIR, 'mcp-server', 'server.rb')
 
 # Detect the VS Code MCP config path based on OS
