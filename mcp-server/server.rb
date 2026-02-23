@@ -22,7 +22,7 @@ SERVER_VERSION = '2.0.0'
 # Get git repo name for better client identification
 def get_git_repo_name(workspace_dir)
   return nil unless workspace_dir && !workspace_dir.empty?
-  
+
   begin
     # Get the remote URL first (most reliable for repo name)
     remote_url = `git -C "#{workspace_dir}" config --get remote.origin.url 2>/dev/null`.strip
@@ -35,7 +35,7 @@ def get_git_repo_name(workspace_dir)
         return "#{$1}/#{$2}".sub(/\.git$/, '')
       end
     end
-    
+
     # Fallback: get the root directory name
     root_dir = `git -C "#{workspace_dir}" rev-parse --show-toplevel 2>/dev/null`.strip
     if root_dir && !root_dir.empty?
@@ -50,21 +50,21 @@ end
 # Get the current git diff for the workspace
 def get_git_diff(workspace_dir)
   return nil unless workspace_dir && !workspace_dir.empty?
-  
+
   begin
     # Check if we're in a git repo
     git_root = `git -C "#{workspace_dir}" rev-parse --show-toplevel 2>/dev/null`.strip
     return nil if git_root.empty?
-    
+
     # Get diff of staged and unstaged changes
     # --no-color ensures clean output
     diff = `git -C "#{git_root}" diff HEAD --no-color 2>/dev/null`.strip
-    
+
     # If no changes against HEAD, try just unstaged changes
     if diff.empty?
       diff = `git -C "#{git_root}" diff --no-color 2>/dev/null`.strip
     end
-    
+
     # Include untracked files with full content (like GitHub PR view)
     untracked = `git -C "#{git_root}" ls-files --others --exclude-standard 2>/dev/null`.strip
     unless untracked.empty?
@@ -72,7 +72,7 @@ def get_git_diff(workspace_dir)
       untracked_diffs = untracked_files.map do |file|
         file_path = File.join(git_root, file)
         next nil unless File.exist?(file_path) && File.file?(file_path)
-        
+
         # Skip binary files
         begin
           content = File.read(file_path, encoding: 'UTF-8')
@@ -80,31 +80,31 @@ def get_git_diff(workspace_dir)
           if content.include?("\x00") || !content.valid_encoding?
             next "diff --git a/#{file} b/#{file}\nnew file mode 100644\nBinary file"
           end
-          
+
           lines = content.split("\n", -1)
           line_count = lines.length
-          
+
           # Format like a git diff for a new file
           header = "diff --git a/#{file} b/#{file}\n"
           header += "new file mode 100644\n"
           header += "--- /dev/null\n"
           header += "+++ b/#{file}\n"
           header += "@@ -0,0 +1,#{line_count} @@\n"
-          
+
           # Add all lines as additions
           diff_content = lines.map { |line| "+#{line}" }.join("\n")
-          
+
           header + diff_content
         rescue => e
           "diff --git a/#{file} b/#{file}\nnew file mode 100644\n# Error reading file: #{e.message}"
         end
       end.compact
-      
+
       if untracked_diffs.any?
         diff = diff.empty? ? untracked_diffs.join("\n\n") : diff + "\n\n" + untracked_diffs.join("\n\n")
       end
     end
-    
+
     return nil if diff.empty?
     diff
   rescue => e
@@ -123,13 +123,13 @@ def resolve_workspace_dir
   if ARGV[0] && !ARGV[0].empty? && !ARGV[0].start_with?('${')
     return ARGV[0]
   end
-  
+
   # Check environment variable (VS Code sets this via env config)
   env_workspace = ENV['MCP_WORKSPACE_DIR']
   if env_workspace && !env_workspace.empty? && !env_workspace.start_with?('${')
     return env_workspace
   end
-  
+
   # Fallback to current directory
   Dir.pwd
 end
@@ -138,32 +138,32 @@ end
 module ClientState
   class << self
     attr_accessor :workspace_dir, :client_name, :pending_requests
-    
+
     def initialize!
       @workspace_dir = resolve_workspace_dir
       @client_name = compute_client_name(@workspace_dir)
       @pending_requests = {} # For tracking outgoing requests (like roots/list)
       @request_id_counter = 0
     end
-    
+
     def next_request_id
       @request_id_counter += 1
       "server-#{@request_id_counter}"
     end
-    
+
     def compute_client_name(workspace)
       git_name = get_git_repo_name(workspace)
       git_name || ENV['CODESPACE_NAME'] || ENV['MCP_CLIENT_NAME'] || "local-#{CLIENT_ID[0..7]}"
     end
-    
+
     def update_from_roots(roots)
       return if roots.nil? || roots.empty?
-      
+
       # Use the first root's URI
       root = roots.first
       uri = root['uri'] || root[:uri]
       return unless uri
-      
+
       # Convert file:// URI to path
       if uri.start_with?('file://')
         path = URI.decode_www_form_component(uri.sub('file://', ''))
@@ -499,7 +499,7 @@ end
 def request_roots_list
   request_id = ClientState.next_request_id
   ClientState.pending_requests[request_id] = 'roots/list'
-  
+
   request = {
     jsonrpc: '2.0',
     id: request_id,
@@ -512,14 +512,14 @@ end
 def handle_client_response(response)
   request_id = response['id']
   pending_method = ClientState.pending_requests.delete(request_id)
-  
+
   return unless pending_method
-  
+
   if response['error']
     log "Client returned error for #{pending_method}: #{response['error']['message']}"
     return
   end
-  
+
   case pending_method
   when 'roots/list'
     roots = response.dig('result', 'roots')

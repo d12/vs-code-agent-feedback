@@ -23,7 +23,7 @@ class ResponseServer
   STALE_CLIENT_TIMEOUT = 15 # seconds - client is considered stale if not seen
   NOTIFICATION_INTERVAL = 5 * 60 # 5 minutes
   TIMEOUT_BUFFER = 10 # seconds before timeout to send auto-response
-  
+
   # Notification modes: :server, :web, :both
   attr_reader :notification_mode
 
@@ -56,7 +56,7 @@ class ResponseServer
 
     # Start the client discovery thread
     @discovery_thread = Thread.new { discovery_loop }
-    
+
     # Start the timeout and notification checker thread
     @timeout_thread = Thread.new { timeout_and_notification_loop }
 
@@ -113,90 +113,90 @@ class ResponseServer
       sleep POLL_INTERVAL
     end
   end
-  
+
   # Timeout and notification checker loop
   def timeout_and_notification_loop
     while @running
       now = Time.now
       requests_to_timeout = []
       requests_to_notify = []
-      
+
       @requests_mutex.synchronize do
         @pending_requests.each do |request_id, req|
           next if @responses.key?(request_id) # Already responded
-          
+
           # Check for timeout (respond just before it expires)
           if req[:expires_at] && now >= (req[:expires_at] - TIMEOUT_BUFFER)
             requests_to_timeout << request_id
             next
           end
-          
+
           # Check if we need to send a reminder notification
           if req[:last_notified_at] && (now - req[:last_notified_at]) >= NOTIFICATION_INTERVAL
             requests_to_notify << request_id
           end
         end
       end
-      
+
       # Handle timeouts (auto-respond with "ask again" message)
       requests_to_timeout.each do |request_id|
         handle_timeout(request_id)
       end
-      
+
       # Send reminder notifications
       requests_to_notify.each do |request_id|
         send_reminder_notification(request_id)
       end
-      
+
       sleep 1 # Check every second for precision
     end
   end
-  
+
   def handle_timeout(request_id)
     @requests_mutex.synchronize do
       req = @pending_requests[request_id]
       return unless req
-      
+
       client_id = req[:client_id]
       client_info = @clients_mutex.synchronize { @clients[client_id] }
-      
+
       if client_info
         # Send auto-response asking to try again
         timeout_response = {
           'error' => 'Request timed out. The user did not respond in time. Please ask again if you still need approval or an answer.'
         }
-        
+
         begin
           uri = URI("#{client_info[:url]}/respond")
           http = Net::HTTP.new(uri.host, uri.port)
           http.open_timeout = 5
           http.read_timeout = 5
-          
+
           post_request = Net::HTTP::Post.new(uri.path)
           post_request['Content-Type'] = 'application/json'
           post_request.body = {
             request_id: request_id,
             response: timeout_response
           }.to_json
-          
+
           http.request(post_request)
           puts "[#{Time.now.strftime('%H:%M:%S')}] Auto-responded to timed out request #{request_id[0..7]}"
         rescue => e
           puts "[Timeout] Error sending timeout response: #{e.message}" if ENV['DEBUG']
         end
       end
-      
+
       # Remove from pending requests
       @pending_requests.delete(request_id)
       @responses[request_id] = { 'timed_out' => true }
     end
   end
-  
+
   def send_reminder_notification(request_id)
     @requests_mutex.synchronize do
       req = @pending_requests[request_id]
       return unless req
-      
+
       # Update last_notified_at so browser knows a reminder is due
       req[:last_notified_at] = Time.now
       puts "[#{Time.now.strftime('%H:%M:%S')}] Reminder due for request #{request_id[0..7]}"
@@ -215,7 +215,7 @@ class ResponseServer
     if response.code == '200'
       data = JSON.parse(response.body)
       client_id = data['client_id']
-      
+
       @clients_mutex.synchronize do
         existing = @clients[client_id]
         @clients[client_id] = {
@@ -225,7 +225,7 @@ class ResponseServer
           port: port,
           timeout_seconds: data['timeout_seconds'] || 1800
         }
-        
+
         if existing.nil?
           puts "[#{Time.now.strftime('%H:%M:%S')}] New client connected: #{data['name'] || client_id} on port #{port}"
         end
@@ -261,7 +261,7 @@ class ResponseServer
       data = JSON.parse(response.body)
       requests = data['requests'] || []
       default_timeout = data['timeout_seconds'] || 1800
-      
+
       @requests_mutex.synchronize do
         requests.each do |req|
           request_id = req['request_id']
@@ -269,7 +269,7 @@ class ResponseServer
 
           created_at = Time.parse(req['created_at'])
           expires_at = req['expires_at'] ? Time.parse(req['expires_at']) : (created_at + default_timeout)
-          
+
           @pending_requests[request_id] = {
             client_id: client_id,
             type: req['type'],
@@ -281,7 +281,7 @@ class ResponseServer
 
           client_name = @clients[client_id][:name]
           puts "[#{Time.now.strftime('%H:%M:%S')}] New #{req['type']} request from #{client_name}"
-          
+
           # Send server-side notification if enabled
           if @notification_mode == :server || @notification_mode == :both
             notify_new_request(req['type'], req['data'], client_name)
@@ -301,7 +301,7 @@ class ResponseServer
     else
       (data['question'] || '').slice(0, 150)
     end
-    
+
     @notifier.notify(
       title: title,
       message: message,
@@ -364,7 +364,7 @@ class ResponseServer
     @clients_mutex.synchronize do
       # Clean up stale clients (not seen recently)
       @clients.reject! { |_, v| Time.now - v[:last_seen] > STALE_CLIENT_TIMEOUT }
-      
+
       clients_list = @clients.map do |id, info|
         {
           id: id,
@@ -373,7 +373,7 @@ class ResponseServer
           last_seen: info[:last_seen].iso8601
         }
       end
-      
+
       { status: 200, body: { clients: clients_list }.to_json }
     end
   end
@@ -382,7 +382,7 @@ class ResponseServer
     @requests_mutex.synchronize do
       # Filter out requests that have been responded to
       pending = @pending_requests.reject { |id, _| @responses.key?(id) }
-      
+
       requests_list = pending.map do |id, req|
         client_name = @clients_mutex.synchronize { @clients[req[:client_id]]&.dig(:name) || 'Unknown' }
         {
@@ -396,7 +396,7 @@ class ResponseServer
           last_notified_at: req[:last_notified_at]&.iso8601
         }
       end
-      
+
       { status: 200, body: { requests: requests_list }.to_json }
     end
   end
@@ -466,7 +466,7 @@ class ResponseServer
             margin: 0;
             padding: 0;
           }
-          
+
           :root {
             --bg-primary: #fafbfc;
             --bg-secondary: #ffffff;
@@ -488,7 +488,7 @@ class ResponseServer
             --radius-md: 12px;
             --radius-lg: 16px;
           }
-          
+
           body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
             background: var(--bg-primary);
@@ -496,7 +496,7 @@ class ResponseServer
             color: var(--text-primary);
             line-height: 1.5;
           }
-          
+
           /* Decorative background pattern */
           body::before {
             content: '';
@@ -509,13 +509,13 @@ class ResponseServer
             opacity: 0.06;
             z-index: -1;
           }
-          
+
           .container {
             max-width: 960px;
             margin: 0 auto;
             padding: 24px;
           }
-          
+
           header {
             text-align: center;
             margin-bottom: 32px;
@@ -527,7 +527,7 @@ class ResponseServer
             position: relative;
             overflow: hidden;
           }
-          
+
           header::before {
             content: '';
             position: absolute;
@@ -537,7 +537,7 @@ class ResponseServer
             height: 4px;
             background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple), var(--accent-rose));
           }
-          
+
           .header-icon {
             width: 64px;
             height: 64px;
@@ -549,19 +549,19 @@ class ResponseServer
             justify-content: center;
             font-size: 28px;
           }
-          
+
           header h1 {
             font-size: 1.75rem;
             font-weight: 700;
             margin-bottom: 8px;
             color: var(--text-primary);
           }
-          
+
           header p {
             color: var(--text-secondary);
             font-size: 0.95rem;
           }
-          
+
           .status-bar {
             display: flex;
             align-items: center;
@@ -574,7 +574,7 @@ class ResponseServer
             box-shadow: var(--shadow-sm);
             flex-wrap: wrap;
           }
-          
+
           .status-bar-label {
             font-size: 0.75rem;
             text-transform: uppercase;
@@ -582,20 +582,20 @@ class ResponseServer
             color: var(--text-muted);
             font-weight: 600;
           }
-          
+
           .clients-list {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
             align-items: center;
           }
-          
+
           .no-clients {
             color: var(--text-muted);
             font-size: 0.85rem;
             font-style: italic;
           }
-          
+
           .client-badge {
             background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
             color: #047857;
@@ -608,7 +608,7 @@ class ResponseServer
             gap: 8px;
             border: 1px solid #a7f3d0;
           }
-          
+
           .client-badge::before {
             content: '';
             width: 8px;
@@ -618,30 +618,30 @@ class ResponseServer
             animation: pulse 2s ease-in-out infinite;
             box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4);
           }
-          
+
           @keyframes pulse {
             0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
             70% { box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); }
             100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
           }
-          
+
           .requests-section {
             margin-top: 8px;
           }
-          
+
           .section-header {
             display: flex;
             align-items: center;
             gap: 12px;
             margin-bottom: 20px;
           }
-          
+
           .section-header h2 {
             font-size: 1.25rem;
             font-weight: 600;
             color: var(--text-primary);
           }
-          
+
           .section-badge {
             background: var(--bg-accent);
             color: var(--text-secondary);
@@ -650,7 +650,7 @@ class ResponseServer
             font-size: 0.75rem;
             font-weight: 600;
           }
-          
+
           .no-requests {
             text-align: center;
             padding: 80px 24px;
@@ -658,7 +658,7 @@ class ResponseServer
             border-radius: var(--radius-lg);
             border: 2px dashed var(--border-medium);
           }
-          
+
           .no-requests .icon-container {
             width: 80px;
             height: 80px;
@@ -670,18 +670,18 @@ class ResponseServer
             justify-content: center;
             font-size: 36px;
           }
-          
+
           .no-requests h3 {
             font-size: 1.1rem;
             color: var(--text-primary);
             margin-bottom: 8px;
           }
-          
+
           .no-requests p {
             color: var(--text-muted);
             font-size: 0.9rem;
           }
-          
+
           .request-card {
             background: var(--bg-secondary);
             border-radius: var(--radius-lg);
@@ -693,7 +693,7 @@ class ResponseServer
             position: relative;
             overflow: hidden;
           }
-          
+
           .request-card::before {
             content: '';
             position: absolute;
@@ -702,20 +702,20 @@ class ResponseServer
             width: 4px;
             height: 100%;
           }
-          
+
           .request-card:hover {
             box-shadow: var(--shadow-lg);
             border-color: var(--border-medium);
           }
-          
+
           .request-card.approval::before {
             background: linear-gradient(180deg, var(--accent-amber), #fbbf24);
           }
-          
+
           .request-card.question::before {
             background: linear-gradient(180deg, var(--accent-blue), #60a5fa);
           }
-          
+
           .request-header {
             display: flex;
             justify-content: space-between;
@@ -723,14 +723,14 @@ class ResponseServer
             margin-bottom: 20px;
             gap: 16px;
           }
-          
+
           .request-type {
             display: flex;
             align-items: center;
             gap: 12px;
             flex-wrap: wrap;
           }
-          
+
           .request-type .badge {
             padding: 6px 14px;
             border-radius: 20px;
@@ -739,36 +739,36 @@ class ResponseServer
             text-transform: uppercase;
             letter-spacing: 0.03em;
           }
-          
+
           .request-type .badge.approval {
             background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
             color: #92400e;
             border: 1px solid #fcd34d;
           }
-          
+
           .request-type .badge.question {
             background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
             color: #1e40af;
             border: 1px solid #93c5fd;
           }
-          
+
           .request-meta {
             font-size: 0.85rem;
             color: var(--text-muted);
           }
-          
+
           .request-content {
             margin-bottom: 20px;
           }
-          
+
           .content-section {
             margin-bottom: 20px;
           }
-          
+
           .content-section:last-child {
             margin-bottom: 0;
           }
-          
+
           .content-section h4 {
             font-size: 0.8rem;
             color: var(--text-secondary);
@@ -777,7 +777,7 @@ class ResponseServer
             letter-spacing: 0.05em;
             font-weight: 600;
           }
-          
+
           .content-section .text {
             background: var(--bg-accent);
             padding: 16px;
@@ -789,20 +789,20 @@ class ResponseServer
             color: var(--text-primary);
             border: 1px solid var(--border-light);
           }
-          
+
           /* Markdown styling */
           .markdown-body {
             white-space: normal;
           }
-          
+
           .markdown-body p {
             margin-bottom: 0.75em;
           }
-          
+
           .markdown-body p:last-child {
             margin-bottom: 0;
           }
-          
+
           .markdown-body code {
             background: var(--bg-secondary);
             padding: 2px 6px;
@@ -811,7 +811,7 @@ class ResponseServer
             font-size: 0.85em;
             border: 1px solid var(--border-light);
           }
-          
+
           .markdown-body pre {
             background: var(--bg-secondary);
             padding: 12px;
@@ -820,53 +820,53 @@ class ResponseServer
             margin: 0.75em 0;
             border: 1px solid var(--border-light);
           }
-          
+
           .markdown-body pre code {
             background: none;
             padding: 0;
             border: none;
           }
-          
+
           .markdown-body ul, .markdown-body ol {
             margin: 0.75em 0;
             padding-left: 1.5em;
           }
-          
+
           .markdown-body li {
             margin-bottom: 0.25em;
           }
-          
-          .markdown-body h1, .markdown-body h2, .markdown-body h3, 
+
+          .markdown-body h1, .markdown-body h2, .markdown-body h3,
           .markdown-body h4, .markdown-body h5, .markdown-body h6 {
             margin: 1em 0 0.5em;
             font-weight: 600;
           }
-          
+
           .markdown-body h1:first-child, .markdown-body h2:first-child,
           .markdown-body h3:first-child, .markdown-body h4:first-child {
             margin-top: 0;
           }
-          
+
           .markdown-body strong {
             font-weight: 600;
           }
-          
+
           .markdown-body a {
             color: var(--accent-blue);
             text-decoration: none;
           }
-          
+
           .markdown-body a:hover {
             text-decoration: underline;
           }
-          
+
           .markdown-body blockquote {
             border-left: 3px solid var(--border-medium);
             padding-left: 1em;
             margin: 0.75em 0;
             color: var(--text-secondary);
           }
-          
+
           /* Diff viewer styles */
           .diff-section {
             margin-top: 16px;
@@ -874,7 +874,7 @@ class ResponseServer
             border-radius: var(--radius-sm);
             overflow: hidden;
           }
-          
+
           .diff-summary {
             display: flex;
             justify-content: space-between;
@@ -885,27 +885,27 @@ class ResponseServer
             font-weight: 500;
             user-select: none;
           }
-          
+
           .diff-summary:hover {
             background: var(--bg-tertiary);
           }
-          
+
           .diff-summary::-webkit-details-marker {
             margin-right: 8px;
           }
-          
+
           .diff-stats {
             font-size: 0.85rem;
             color: var(--text-secondary);
             font-weight: normal;
           }
-          
+
           .diff-content {
             max-height: 500px;
             overflow: auto;
             background: #1e1e1e;
           }
-          
+
           .diff-view {
             margin: 0;
             padding: 16px;
@@ -916,64 +916,64 @@ class ResponseServer
             overflow-x: auto;
             color: #d4d4d4;
           }
-          
+
           .diff-view span {
             display: block;
           }
-          
+
           .diff-header {
             color: #569cd6;
             font-weight: bold;
             margin-top: 8px;
           }
-          
+
           .diff-header:first-child {
             margin-top: 0;
           }
-          
+
           .diff-file {
             color: #ce9178;
             font-weight: bold;
           }
-          
+
           .diff-hunk {
             color: #c586c0;
             background: rgba(197, 134, 192, 0.1);
             margin: 8px 0 4px 0;
             padding: 2px 0;
           }
-          
+
           .diff-add {
             color: #4ec9b0;
             background: rgba(78, 201, 176, 0.15);
           }
-          
+
           .diff-del {
             color: #f14c4c;
             background: rgba(241, 76, 76, 0.15);
           }
-          
+
           .diff-context {
             color: #d4d4d4;
           }
-          
+
           .diff-comment {
             color: #6a9955;
             font-style: italic;
           }
-          
+
           .response-section {
             border-top: 1px solid var(--border-light);
             padding-top: 20px;
             margin-top: 20px;
           }
-          
+
           .response-buttons {
             display: flex;
             gap: 12px;
             flex-wrap: wrap;
           }
-          
+
           .btn {
             padding: 12px 24px;
             border-radius: var(--radius-sm);
@@ -986,54 +986,54 @@ class ResponseServer
             align-items: center;
             gap: 8px;
           }
-          
+
           .btn-approve {
             background: linear-gradient(135deg, #10b981 0%, #059669 100%);
             color: white;
             box-shadow: 0 2px 8px rgba(16, 185, 129, 0.3);
           }
-          
+
           .btn-approve:hover {
             transform: translateY(-1px);
             box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
           }
-          
+
           .btn-reject {
             background: var(--bg-secondary);
             color: var(--accent-rose);
             border: 2px solid var(--accent-rose);
           }
-          
+
           .btn-reject:hover {
             background: #fff1f2;
           }
-          
+
           .btn-submit {
             background: linear-gradient(135deg, var(--accent-blue) 0%, #2563eb 100%);
             color: white;
             box-shadow: 0 2px 8px rgba(59, 130, 246, 0.3);
           }
-          
+
           .btn-submit:hover {
             transform: translateY(-1px);
             box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
           }
-          
+
           .feedback-area {
             display: none;
             margin-top: 16px;
             animation: slideDown 0.2s ease;
           }
-          
+
           @keyframes slideDown {
             from { opacity: 0; transform: translateY(-8px); }
             to { opacity: 1; transform: translateY(0); }
           }
-          
+
           .feedback-area.visible {
             display: block;
           }
-          
+
           .feedback-area textarea,
           .answer-area textarea {
             width: 100%;
@@ -1049,26 +1049,26 @@ class ResponseServer
             margin-bottom: 12px;
             transition: border-color 0.2s ease, box-shadow 0.2s ease;
           }
-          
+
           .feedback-area textarea:focus,
           .answer-area textarea:focus {
             outline: none;
             border-color: var(--accent-blue);
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
           }
-          
+
           .feedback-area textarea::placeholder,
           .answer-area textarea::placeholder {
             color: var(--text-muted);
           }
-          
+
           footer {
             text-align: center;
             padding: 32px 24px;
             color: var(--text-muted);
             font-size: 0.8rem;
           }
-          
+
           .loading {
             display: inline-block;
             width: 18px;
@@ -1078,7 +1078,7 @@ class ResponseServer
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
           }
-          
+
           .countdown-timer {
             display: inline-flex;
             align-items: center;
@@ -1091,37 +1091,37 @@ class ResponseServer
             color: var(--text-secondary);
             border: 1px solid var(--border-light);
           }
-          
+
           .countdown-timer.warning {
             background: #fef3c7;
             color: #92400e;
             border-color: #fcd34d;
           }
-          
+
           .countdown-timer.critical {
             background: #fee2e2;
             color: #991b1b;
             border-color: #fca5a5;
             animation: pulse-critical 1s ease-in-out infinite;
           }
-          
+
           @keyframes pulse-critical {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.7; }
           }
-          
+
           .countdown-timer svg {
             width: 14px;
             height: 14px;
           }
-          
+
           /* Request selection styles */
           .request-card.selected {
             outline: 3px solid var(--accent-blue);
             outline-offset: 2px;
             box-shadow: var(--shadow-lg), 0 0 0 6px rgba(59, 130, 246, 0.1);
           }
-          
+
           /* Keyboard hints */
           .keyboard-hints {
             position: fixed;
@@ -1136,23 +1136,23 @@ class ResponseServer
             box-shadow: var(--shadow-md);
             z-index: 100;
           }
-          
+
           .keyboard-hints h4 {
             font-weight: 600;
             margin-bottom: 8px;
             color: var(--text-secondary);
           }
-          
+
           .keyboard-hints ul {
             list-style: none;
             margin: 0;
             padding: 0;
           }
-          
+
           .keyboard-hints li {
             margin-bottom: 4px;
           }
-          
+
           .keyboard-hints kbd {
             background: var(--bg-tertiary);
             padding: 2px 6px;
@@ -1162,7 +1162,7 @@ class ResponseServer
             border: 1px solid var(--border-light);
             margin-right: 6px;
           }
-          
+
           @media (max-width: 640px) {
             .container { padding: 16px; }
             header { padding: 24px 16px; }
@@ -1179,14 +1179,14 @@ class ResponseServer
             <h1>Agent Approval Center</h1>
             <p>Review and respond to AI agent requests from your CodeSpaces</p>
           </header>
-          
+
           <div class="status-bar">
             <span class="status-bar-label">Connected:</span>
             <div class="clients-list" id="clients-list">
               <span class="no-clients">No clients connected</span>
             </div>
           </div>
-          
+
           <div class="requests-section">
             <div class="section-header">
               <h2>Pending Requests</h2>
@@ -1200,12 +1200,12 @@ class ResponseServer
               </div>
             </div>
           </div>
-          
+
           <footer>
             Agent Approval MCP Server &middot; Listening on port <span id="port-display">18463</span>
           </footer>
         </div>
-        
+
         <!-- Keyboard hints -->
         <div class="keyboard-hints" id="keyboard-hints">
           <h4>⌨️ Keyboard Shortcuts</h4>
@@ -1220,7 +1220,7 @@ class ResponseServer
             <li><kbd>?</kbd> Toggle hints</li>
           </ul>
         </div>
-        
+
         <script>
           const API_BASE = '';
           const NOTIFICATION_MODE = '#{@notification_mode}'; // server, web, or both
@@ -1231,12 +1231,12 @@ class ResponseServer
           let lastNotifiedAt = {}; // Track when we last sent notification for each request
           let isFirstFetch = true; // Don't notify on initial page load
           const REMINDER_INTERVAL = 5 * 60 * 1000; // 5 minutes in ms
-          
+
           // Request notification permission on load
           if ('Notification' in window && Notification.permission === 'default') {
             Notification.requestPermission();
           }
-          
+
           // Audio context for notification sound
           let audioContext = null;
           function playNotificationSound() {
@@ -1263,11 +1263,11 @@ class ResponseServer
               console.log('Could not play notification sound:', e);
             }
           }
-          
+
           // Flash the tab title when there are pending requests
           let originalTitle = document.title;
           let titleFlashInterval = null;
-          
+
           function startTitleFlash(count) {
             if (titleFlashInterval) return;
             let showAlert = true;
@@ -1276,7 +1276,7 @@ class ResponseServer
               showAlert = !showAlert;
             }, 1000);
           }
-          
+
           function stopTitleFlash() {
             if (titleFlashInterval) {
               clearInterval(titleFlashInterval);
@@ -1284,17 +1284,17 @@ class ResponseServer
               document.title = originalTitle;
             }
           }
-          
+
           function sendBrowserNotification(title, body, requestId) {
             // Only send browser notifications if mode is 'web' or 'both'
             if (NOTIFICATION_MODE === 'server') {
               console.log('Skipping browser notification (server mode)');
               return;
             }
-            
+
             // Play sound immediately
             playNotificationSound();
-            
+
             if ('Notification' in window && Notification.permission === 'granted') {
               console.log('Sending browser notification:', title);
               const notification = new Notification(title, {
@@ -1314,12 +1314,12 @@ class ResponseServer
               console.log('Cannot send notification - permission:', Notification.permission);
             }
           }
-          
+
           function formatText(text) {
             // Escape HTML and convert newlines to <br> for proper formatting
             return escapeHtml(text || '').split(String.fromCharCode(10)).join('<br>');
           }
-          
+
           function renderMarkdown(text) {
             if (!text) return '';
             try {
@@ -1334,7 +1334,7 @@ class ResponseServer
               return escapeHtml(text);
             }
           }
-          
+
           function renderDiff(diff) {
             if (!diff) return '';
             const lines = diff.split(String.fromCharCode(10));
@@ -1356,7 +1356,7 @@ class ResponseServer
               return `<span class="diff-context">${escaped}</span>`;
             }).join(String.fromCharCode(10));
           }
-          
+
           function getDiffStats(diff) {
             if (!diff) return '';
             const lines = diff.split(String.fromCharCode(10));
@@ -1372,17 +1372,17 @@ class ResponseServer
             if (deletions > 0) parts.push(`-${deletions}`);
             return parts.join(', ');
           }
-          
+
           async function fetchClients() {
             try {
               const res = await fetch(API_BASE + '/api/clients');
               const data = await res.json();
-              
+
               const clientsList = document.getElementById('clients-list');
               if (data.clients.length === 0) {
                 clientsList.innerHTML = '<span class="no-clients">No clients connected</span>';
               } else {
-                clientsList.innerHTML = data.clients.map(c => 
+                clientsList.innerHTML = data.clients.map(c =>
                   `<span class="client-badge">${escapeHtml(c.name)}</span>`
                 ).join('');
               }
@@ -1390,32 +1390,32 @@ class ResponseServer
               console.error('Error fetching clients:', e);
             }
           }
-          
+
           async function fetchRequests() {
             try {
               const res = await fetch(API_BASE + '/api/requests');
               const data = await res.json();
-              
+
               const currentIds = new Set(data.requests.map(r => r.id));
               const now = Date.now();
-              
+
               // Start or stop title flashing based on pending requests
               if (data.requests.length > 0 && !document.hasFocus()) {
                 startTitleFlash(data.requests.length);
               } else if (data.requests.length === 0) {
                 stopTitleFlash();
               }
-              
+
               // Check for new requests and send browser notifications (skip first fetch)
               if (!isFirstFetch) {
                 for (const req of data.requests) {
                   // New request notification
                   if (!lastRequestIds.has(req.id)) {
                     const repoName = req.client_name || 'Unknown';
-                    const title = req.type === 'approval' 
+                    const title = req.type === 'approval'
                       ? `Review needed for ${repoName}`
                       : `Question from ${repoName}`;
-                    const body = req.type === 'approval' 
+                    const body = req.type === 'approval'
                       ? (req.data?.work_summary || '').substring(0, 150)
                       : (req.data?.question || '').substring(0, 150);
                     sendBrowserNotification(title, body, req.id);
@@ -1438,37 +1438,37 @@ class ResponseServer
                 }
                 isFirstFetch = false;
               }
-              
+
               // Stop title flash when window is focused
               window.addEventListener('focus', stopTitleFlash);
-              
+
               lastRequestIds = currentIds;
-              
+
               // Clean up old notification timestamps
               for (const id of Object.keys(lastNotifiedAt)) {
                 if (!currentIds.has(id)) {
                   delete lastNotifiedAt[id];
                 }
               }
-              
+
               // Store all requests for keyboard navigation
               allRequests = data.requests;
-              
-              document.getElementById('request-badge').textContent = 
-                data.requests.length === 0 ? '0 waiting' : 
-                data.requests.length === 1 ? '1 waiting' : 
+
+              document.getElementById('request-badge').textContent =
+                data.requests.length === 0 ? '0 waiting' :
+                data.requests.length === 1 ? '1 waiting' :
                 data.requests.length + ' waiting';
-              
+
               const container = document.getElementById('requests-container');
-              
+
               // Check if we have an active element (user is typing)
               const activeEl = document.activeElement;
               const isUserTyping = activeEl && activeEl.tagName === 'TEXTAREA';
-              
+
               // Create a signature of current requests to detect changes
               const requestsJson = JSON.stringify(data.requests.map(r => r.id).sort());
               const hasChanged = requestsJson !== lastRequestsJson;
-              
+
               if (data.requests.length === 0) {
                 lastRequestsJson = requestsJson;
                 container.innerHTML = `
@@ -1483,7 +1483,7 @@ class ResponseServer
                 // But first, save any user input
                 const savedInputs = {};
                 const savedVisibility = {};
-                
+
                 if (!isUserTyping) {
                   // Safe to rebuild
                   lastRequestsJson = requestsJson;
@@ -1496,10 +1496,10 @@ class ResponseServer
                   document.querySelectorAll('.feedback-area.visible').forEach(fa => {
                     savedVisibility[fa.id] = true;
                   });
-                  
+
                   lastRequestsJson = requestsJson;
                   container.innerHTML = data.requests.map(r => renderRequest(r)).join('');
-                  
+
                   // Restore inputs
                   Object.entries(savedInputs).forEach(([id, value]) => {
                     const el = document.getElementById(id);
@@ -1512,14 +1512,14 @@ class ResponseServer
                 }
               }
               // If nothing changed and user might be typing, don't touch the DOM
-              
+
             } catch (e) {
               console.error('Error fetching requests:', e);
             }
           }
-          
+
           function renderRequest(req) {
-            const countdownHtml = req.expires_at ? 
+            const countdownHtml = req.expires_at ?
               `<span class="countdown-timer" data-expires="${req.expires_at}" id="timer-${req.id}">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <circle cx="12" cy="12" r="10"></circle>
@@ -1527,7 +1527,7 @@ class ResponseServer
                 </svg>
                 <span class="countdown-value">--:--</span>
               </span>` : '';
-            
+
             if (req.type === 'approval') {
               return `
                 <div class="request-card approval" data-id="${req.id}" data-expires="${req.expires_at || ''}">
@@ -1608,28 +1608,28 @@ class ResponseServer
             }
             return '';
           }
-          
+
           function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text || '';
             return div.innerHTML;
           }
-          
+
           function formatTime(isoString) {
             const date = new Date(isoString);
             return date.toLocaleTimeString();
           }
-          
+
           function showFeedback(requestId) {
             const feedbackArea = document.getElementById('feedback-' + requestId);
             feedbackArea.classList.add('visible');
-            
+
             // Auto-focus the textarea
             const textarea = document.getElementById('feedback-text-' + requestId);
             if (textarea) {
               textarea.focus();
             }
-            
+
             // Scroll the card into view so button is fully visible
             const card = feedbackArea.closest('.request-card');
             if (card) {
@@ -1638,11 +1638,11 @@ class ResponseServer
               }, 100);
             }
           }
-          
+
           async function approveRequest(requestId) {
             await sendResponse(requestId, { approved: true, feedback: null });
           }
-          
+
           async function rejectRequest(requestId) {
             const feedback = document.getElementById('feedback-text-' + requestId).value;
             if (!feedback.trim()) {
@@ -1651,7 +1651,7 @@ class ResponseServer
             }
             await sendResponse(requestId, { approved: false, feedback: feedback });
           }
-          
+
           async function answerQuestion(requestId) {
             const answer = document.getElementById('answer-text-' + requestId).value;
             if (!answer.trim()) {
@@ -1660,7 +1660,7 @@ class ResponseServer
             }
             await sendResponse(requestId, { answer: answer });
           }
-          
+
           async function sendResponse(requestId, response) {
             try {
               const res = await fetch(API_BASE + '/api/respond', {
@@ -1668,7 +1668,7 @@ class ResponseServer
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ request_id: requestId, response: response })
               });
-              
+
               if (res.ok) {
                 fetchRequests();
               } else {
@@ -1679,20 +1679,20 @@ class ResponseServer
               alert('Error sending response: ' + e.message);
             }
           }
-          
+
           // Update countdown timers
           function updateCountdowns() {
             document.querySelectorAll('.countdown-timer').forEach(timer => {
               const expiresAt = timer.dataset.expires;
               if (!expiresAt) return;
-              
+
               const expires = new Date(expiresAt);
               const now = new Date();
               const remainingMs = expires - now;
-              
+
               const valueEl = timer.querySelector('.countdown-value');
               if (!valueEl) return;
-              
+
               if (remainingMs <= 0) {
                 valueEl.textContent = 'Expired';
                 timer.classList.add('critical');
@@ -1701,9 +1701,9 @@ class ResponseServer
                 const totalSeconds = Math.floor(remainingMs / 1000);
                 const minutes = Math.floor(totalSeconds / 60);
                 const seconds = totalSeconds % 60;
-                
+
                 valueEl.textContent = `${minutes}:${seconds.toString().padStart(2, '0')}`;
-                
+
                 // Add warning/critical classes based on time remaining
                 timer.classList.remove('warning', 'critical');
                 if (minutes < 2) {
@@ -1714,17 +1714,17 @@ class ResponseServer
               }
             });
           }
-          
+
           // Selection management
           function selectRequest(index) {
             // Remove previous selection
             document.querySelectorAll('.request-card.selected').forEach(el => el.classList.remove('selected'));
-            
+
             if (index < 0 || index >= allRequests.length) {
               selectedRequestIndex = -1;
               return;
             }
-            
+
             selectedRequestIndex = index;
             const card = document.querySelector(`.request-card[data-id="${allRequests[index].id}"]`);
             if (card) {
@@ -1732,19 +1732,19 @@ class ResponseServer
               card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
             }
           }
-          
+
           function getSelectedRequest() {
             if (selectedRequestIndex >= 0 && selectedRequestIndex < allRequests.length) {
               return allRequests[selectedRequestIndex];
             }
             return null;
           }
-          
+
           // Keyboard handling
           document.addEventListener('keydown', (e) => {
             const activeElement = document.activeElement;
             const isTyping = activeElement?.tagName === 'TEXTAREA' || activeElement?.tagName === 'INPUT';
-            
+
             // Handle Escape - unfocus if typing, otherwise deselect
             // Important: only blur OR deselect, never both on same keypress
             if (e.key === 'Escape') {
@@ -1760,7 +1760,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Don't handle other shortcuts while typing
             if (isTyping) {
               // Ctrl/Cmd+Enter to submit from textarea
@@ -1780,7 +1780,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Navigation
             if (e.key === 'j' || e.key === 'ArrowDown') {
               e.preventDefault();
@@ -1789,7 +1789,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             if (e.key === 'k' || e.key === 'ArrowUp') {
               e.preventDefault();
               if (allRequests.length > 0) {
@@ -1797,7 +1797,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Quick approve
             if (e.key === 'a') {
               e.preventDefault();
@@ -1807,7 +1807,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Show feedback / answer area
             if (e.key === 'r' || e.key === 'Enter') {
               e.preventDefault();
@@ -1831,7 +1831,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Send feedback (S key)
             if (e.key === 's') {
               e.preventDefault();
@@ -1849,7 +1849,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Toggle diff (D key)
             if (e.key === 'd') {
               e.preventDefault();
@@ -1865,7 +1865,7 @@ class ResponseServer
               }
               return;
             }
-            
+
             // Toggle keyboard hints
             if (e.key === '?') {
               e.preventDefault();
@@ -1873,7 +1873,7 @@ class ResponseServer
               hints.style.display = hints.style.display === 'none' ? 'block' : 'none';
               return;
             }
-            
+
             // Select first request if none selected and navigating
             if (allRequests.length > 0 && selectedRequestIndex < 0) {
               if (['j', 'k', 'ArrowDown', 'ArrowUp'].includes(e.key)) {
@@ -1881,17 +1881,17 @@ class ResponseServer
               }
             }
           });
-          
+
           // Poll for updates
           setInterval(fetchClients, 2000);
           setInterval(fetchRequests, 2000);
           setInterval(updateCountdowns, 1000); // Update timers every second
-          
+
           // Initial fetch
           fetchClients();
           fetchRequests();
           setTimeout(updateCountdowns, 100); // Initial countdown update
-          
+
           // Rapid initial client polling to catch name updates quickly
           setTimeout(fetchClients, 500);
           setTimeout(fetchClients, 1000);
@@ -1929,19 +1929,19 @@ end
 # Main entry point
 if __FILE__ == $PROGRAM_NAME
   require 'optparse'
-  
+
   options = {
     port: (ENV['RESPONSE_SERVER_PORT'] || ResponseServer::DEFAULT_PORT).to_i,
     notification_mode: (ENV['NOTIFICATION_MODE'] || 'server').to_sym
   }
-  
+
   OptionParser.new do |opts|
     opts.banner = "Usage: #{$PROGRAM_NAME} [options]"
-    
+
     opts.on('-p', '--port PORT', Integer, "Port to listen on (default: #{ResponseServer::DEFAULT_PORT})") do |p|
       options[:port] = p
     end
-    
+
     opts.on('-n', '--notifications MODE', [:server, :web, :both],
             'Notification mode: server, web, or both (default: server)',
             '  server - OS notifications that focus Chrome when clicked',
@@ -1949,13 +1949,13 @@ if __FILE__ == $PROGRAM_NAME
             '  both   - Both server and browser notifications') do |mode|
       options[:notification_mode] = mode
     end
-    
+
     opts.on('-h', '--help', 'Show this help') do
       puts opts
       exit
     end
   end.parse!
-  
+
   # Legacy positional argument support
   if ARGV[0] && options[:port] == ResponseServer::DEFAULT_PORT
     options[:port] = ARGV[0].to_i

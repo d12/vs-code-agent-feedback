@@ -16,13 +16,13 @@ module Notifier
       # Escape quotes for shell
       escaped_title = title.gsub('"', '\\"').gsub("'", "'\\''")
       escaped_message = message.gsub('"', '\\"').gsub("'", "'\\''")
-      
+
       # Try terminal-notifier first (supports click actions)
       if command_exists?('terminal-notifier')
         # Use -execute to run AppleScript that finds and focuses the correct Chrome tab
         # This handles: multiple Chrome windows, user browsing other tabs, etc.
         focus_script = build_chrome_focus_script(url)
-        
+
         args = [
           'terminal-notifier',
           '-title', title,
@@ -30,7 +30,7 @@ module Notifier
           '-sound', 'default',
           '-execute', focus_script
         ]
-        
+
         system(*args)
       else
         # Fallback to osascript (no click action support)
@@ -40,21 +40,21 @@ module Notifier
         )
       end
     end
-    
+
     private
-    
+
     def command_exists?(cmd)
       system("which #{cmd} > /dev/null 2>&1")
     end
-    
+
     # Build an AppleScript command that finds and focuses the Chrome tab with our URL
     def build_chrome_focus_script(url)
       return 'open -a "Google Chrome"' unless url
-      
+
       # Extract the host:port to match (handles both http and https, with or without path)
       # For localhost:18463, we want to match any tab containing that
       match_pattern = url.sub(%r{^https?://}, '').sub(%r{/.*$}, '')
-      
+
       # AppleScript to find the tab and focus it
       # Each line becomes a separate -e argument to osascript
       lines = [
@@ -81,7 +81,7 @@ module Notifier
         'end if',
         'end tell'
       ]
-      
+
       # Build osascript command with multiple -e flags
       args = lines.flat_map { |line| ['-e', line] }
       (['osascript'] + args).shelljoin
@@ -94,7 +94,7 @@ module Notifier
       # notify-send doesn't support click actions easily
       # Some desktop environments support actions though
       system('notify-send', '--urgency=critical', title, message)
-      
+
       # If URL provided, try xdg-open in background (optional)
       if url
         Thread.new do
@@ -130,7 +130,7 @@ module Notifier
       warn "Email notifications not yet implemented"
     end
   end
-  
+
   # Null notifier - does nothing (for web-only mode)
   class Null < Base
     def notify(title:, message:, url: nil)
@@ -150,7 +150,7 @@ module Notifier
       MacOS.new
     end
   end
-  
+
   def self.null
     Null.new
   end

@@ -86,7 +86,7 @@ server_thread = Thread.new do
       end
 
       method, path, = request_line.split(' ')
-      
+
       response_body = case [method, path]
       when ['GET', '/mcp-status']
         { client_id: client_id, name: client_name, version: '2.0.0', port: MCP_CALLBACK_PORT }.to_json
@@ -129,7 +129,7 @@ discovered = false
   uri = URI("#{RESPONSE_SERVER_URL}/api/clients")
   response = Net::HTTP.get_response(uri)
   data = JSON.parse(response.body)
-  
+
   if data['clients'].any? { |c| c['id'] == client_id }
     puts "   ✓ Response server discovered our client!"
     discovered = true
